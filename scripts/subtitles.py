@@ -1,43 +1,105 @@
+'''
+[whisper 输入转 srt]
+python scripts/subtitles.py -t whisper -s srt -p xxx.txt
+
+[funasr-nano 输入转 srt]
+python scripts/subtitles.py -t funasr-nano -s srt -p xxx.txt
+
+[funasr-nano 输入转 ass]
+python scripts/subtitles.py -t funasr-nano -s ass -p xxx.txt
+
+uv run scripts/subtitles.py --type funasr-nano --subtitle-type srt --input "{'key': 'output', 'text': '首先解压下载的压缩包。 然后', 'text_tn': '首先解压下载的压缩包 sil 然后', 'label': 'null', 'ctc_text': '首先解压下载的压缩包  然后', 'ctc_timestamps': [{'token': '首', 'start_time': 1.26, 'end_time': 1.32, 'score': 0.998}, {'token': '先', 'start_time': 1.44, 'end_time': 1.5, 'score': 1.0}, {'token': '解', 'start_time': 1.62, 'end_time': 1.68, 'score': 0.999}, {'token': '压', 'start_time': 1.8, 'end_time': 1.86, 'score': 0.991}, {'token': '下', 'start_time': 2.04, 'end_time': 2.1, 'score': 1.0}, {'token': '载', 'start_time': 2.16, 'end_time': 2.22, 'score': 1.0}, {'token': '的', 'start_time': 2.28, 'end_time': 2.34, 'score': 0.64}, {'token': '压', 'start_time': 2.46, 'end_time': 2.52, 'score': 0.993}, {'token': '缩', 'start_time': 2.64, 'end_time': 2.7, 'score': 0.986}, {'token': '包', 'start_time': 2.82, 'end_time': 2.88, 'score': 0.999}, {'token': ' ', 'start_time': 3.18, 'end_time': 3.3, 'score': 0.946}, {'token': ' ', 'start_time': 8.52, 'end_time': 8.58, 'score': 0.706}, {'token': '然', 'start_time': 9.0, 'end_time': 9.06, 'score': 0.997}, {'token': '后', 'start_time': 9.12, 'end_time': 9.18, 'score': 0.991}]}"
+'''
+import ast
 import re
+import argparse
+from typing import Iterator
+from pathlib import Path
 
 
 class SRT_Resolver:
-  def __init__(self, whisper_output: str, title='') -> None:
+  def __init__(self, content: str, title='', input_type='whisper') -> None:
     self.title = title
+    self.input_type = input_type
     self.time_format = r'{:02}:{:02}:{:02},{:03} --> {:02}:{:02}:{:02},{:03}'
     self.timelines: list[tuple]
     self.resolve_pattern = re.compile(r'\[(\d+\.\d+)s\s->\s(\d+\.\d+)s\]\s+(.+)')
-    self.reset_input(whisper_output)
+    self.reset_input(content)
 
-  def reset_input(self, whisper_output='', title=None):
+  def reset_input(self, content='', title=None):
     '''
       whisper_output: ([28.22s -> 31.04s] エクスプローション!, ...)
       timelines: [(start_seconds, end_seconds, text), ...]
     '''
-    if whisper_output != '':
-      self.timelines = []
-      for line in whisper_output.split('\n'):
-        if line == '':
-          continue
-        m = self.resolve_pattern.search(line)
-        if m is None:
-          continue
-        self.timelines.append(m.groups())
+    if content != '':
+      if self.input_type == 'funasr-nano':
+        self.timelines = self.resolve_funasr_nano(content)
+      else:
+        self.timelines = self.resolve_whisper(content)
     if title is not None:
       self.title = title
 
+  def resolve_whisper(self, content: str):
+    timelines = []
+    for line in content.split('\n'):
+      if line == '':
+        continue
+      m = self.resolve_pattern.search(line)
+      if m is None:
+        continue
+      timelines.append(m.groups())
+    return timelines
+
+  @staticmethod
+  def split_funasr_nano_sentences(text: str, timestamps: list[dict]):
+    sentence_endings = set('。！？!?；;')
+    punctuation = sentence_endings | set('，、：“”‘’（）()《》【】…,.')
+    tokens = [token for token in timestamps if token.get('token', '').strip()]
+    token_index = 0
+    sentence_chars = []
+    sentence_start = None
+    sentence_end = None
+    timelines = []
+
+    for ch in text:
+      sentence_chars.append(ch)
+      if (not ch.isspace()) and (ch not in punctuation):
+        if token_index >= len(tokens):
+          continue
+        token = tokens[token_index]
+        token_index += 1
+        if sentence_start is None:
+          sentence_start = token['start_time']
+        sentence_end = token['end_time']
+      if ch in sentence_endings:
+        sentence = ''.join(sentence_chars).strip()
+        if sentence and sentence_start is not None and sentence_end is not None:
+          timelines.append((sentence_start, sentence_end, sentence))
+        sentence_chars = []
+        sentence_start = None
+        sentence_end = None
+
+    sentence = ''.join(sentence_chars).strip()
+    if sentence and sentence_start is not None and sentence_end is not None:
+      timelines.append((sentence_start, sentence_end, sentence))
+    return timelines
+
+  def resolve_funasr_nano(self, content: str):
+    item = ast.literal_eval(content)
+    timelines = []
+    text = item.get('text', '')
+    # 启用VAD时有timestamps，会考虑分片的时间连续，此时ctc_timestamps是错的，分片间时间会重置
+    timestamps = item.get('timestamps', item.get('ctc_timestamps', []))
+    timelines.extend(self.split_funasr_nano_sentences(text, timestamps))
+    return timelines
+
   @staticmethod
   def format_seconds(second):
-    if not isinstance(second, str):
-      second = str(second)
-    # 将秒数分割成整数部分和小数部分
-    s, ms = second.split('.')
-    if len(ms) > 3:
-      ms = round(float(f'{ms[:3]}.{ms[3:]}'), 0)
-    # 计算小时、分钟和秒
-    h, remainder = divmod(int(s), 3600)
+    second = float(second)
+    total_ms = round(second * 1000)
+    total_seconds, ms = divmod(total_ms, 1000)
+    h, remainder = divmod(total_seconds, 3600)
     m, s = divmod(remainder, 60)
-    ms = int(ms)
     return h, m, s, ms
 
   def format_pre(self):
@@ -59,8 +121,8 @@ class SRT_Resolver:
 
 
 class ASS_Resolver(SRT_Resolver):
-  def __init__(self, whisper_output: str, title='') -> None:
-    super().__init__(whisper_output, title)
+  def __init__(self, content: str, title='', input_type='whisper') -> None:
+    super().__init__(content, title, input_type)
     self.time_format = r'{:01}:{:02}:{:02}.{:02},{:01}:{:02}:{:02}.{:02}'
 
   def format_pre(self):
@@ -85,26 +147,37 @@ class ASS_Resolver(SRT_Resolver):
     return f'Dialogue: 0,{time},DS,,0,0,0,,{text}\n'
 
 
+def parse_args():
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--path', '-p', help='input transcript file path', type=Path, default=None)
+  parser.add_argument('--input', '-i', help='input transcript string', type=str, default=None)
+  parser.add_argument('--type', '-t', help='input transcript type', choices=['whisper', 'funasr-nano'], type=str, default='whisper')
+  parser.add_argument('--subtitle-type', '-s', help='subtitle output type', choices=['srt', 'ass'], type=str, default='srt')
+  args = parser.parse_args()
+  return args
+
+
+def run(content: str, input_type: str, subtitle_type: str, stream: bool = False) -> str | Iterator[str]:
+  resolver_cls = dict(srt=SRT_Resolver, ass=ASS_Resolver).get(subtitle_type.lower(), SRT_Resolver)
+  resolver = resolver_cls(content, input_type=input_type.lower())
+  chunks = resolver()
+  if stream:
+    return chunks
+  return ''.join(chunks)
+
+
 if __name__ == '__main__':
-  import argparse
-  from pathlib import Path
   from tqdm import tqdm
 
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--path", '-p', help="input whisper output file path", type=Path, default=None)
-  parser.add_argument("--input", '-i', help="input whisper output string", type=str, default=None)
-  parser.add_argument("--type", '-t', help="subtitle type", type=str, default='SRT')
-  args = parser.parse_args()
-
+  args = parse_args()
   path: Path = args.path
-  stype = args.type.lower()
-  title: str = 'no-title'
+  input_type = args.type.lower()
+  subtitle_type = args.subtitle_type.lower()
   content: str = args.input
   if path is not None:
-    title = path.stem
     with path.open('r', encoding='utf-8') as f:
       content = f.read()
-  content = content or r"""
+  content = content or r'''
     [0.68s -> 6.0206000000000005s] 黒より黒く、闇より暗く漆黒に、我が真紅の今後を望みたもう。
     [6.8s -> 12.5s] 覚醒の時来たれり、無病の境界に落ちし断り、無行の歪みとなりて現出せよ!
     [13.14s -> 20.12s] 踊れ、踊れ、踊れ!我が力の本流に望むは崩壊なり、並ぶ者なき崩壊なり!
@@ -112,16 +185,14 @@ if __name__ == '__main__':
     [23.86s -> 28.22s] 終焉の王国の地に力の根源を引いてくせし者を我が前に滑べよ!
     [28.22s -> 31.04s] エクスプローション!
     [32.14s -> 32.36s] ドン!
-  """
+  '''
 
-  r = dict(srt=SRT_Resolver, ass=ASS_Resolver).get(stype, SRT_Resolver)
-  r = r(content)
   if path is None:
-    for t in r():
-      print(t, end='')
+    subtitle = run(content, input_type=input_type, subtitle_type=subtitle_type)
+    print(subtitle, end='')
   else:
-    f = path.with_suffix(f'.{stype}').open('w', encoding='utf-8')
-    for t in tqdm(r()):
-      f.write(t)
-    f.close()
+    output_path = path.with_suffix(f'.{subtitle_type}')
+    with output_path.open('w', encoding='utf-8') as f:
+      for chunk in tqdm(run(content, input_type=input_type, subtitle_type=subtitle_type, stream=True)):
+        f.write(chunk)
     print(f'{f.name} saved')
