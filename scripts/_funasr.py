@@ -11,20 +11,22 @@ uv pip install -e ./
 cd D:\Code\projects\FunASR
 $audio = "D:/Document/Audio/!raw/篠宮ゆり.aac"
 $audio = "D:/Document/ai-sings/Ending Note/Ending Note 門谷純_Vocals_vocals.flac"
-$audio = "D:\Document\Video\leafflow\output.flac"
-uv run scripts/_funasr.py -m FunAudioLLM/Fun-ASR-Nano-2512 -i $audio
+$audio = "D:\Document\Video\leafflow\vocal\output.flac"
+uv run scripts/_funasr.py -m FunAudioLLM/Fun-ASR-Nano-2512 -i $audio -s "raw|srt"
 '''
 
 import sys
 import os
 import json
 from pathlib import Path
+from typing import Iterator
 
 from funasr import AutoModel
 
 sys.path.append('.')
 from scripts import ROOT, parse_transcribe_args
 from scripts.subtitles import run as build_subtitle
+
 
 model_dir = ROOT / 'model_zoo/models'
 vad_model_dir = model_dir / 'speech_fsmn_vad_zh-cn-16k-common-pytorch'
@@ -77,20 +79,34 @@ def run(model, mname, inputs:list[Path|str], vad_model=None):
   # print(text)
 
 
-def output_path_for(input_path: Path, subtitle_type: str | None):
-  suffix = f'.{subtitle_type}' if subtitle_type else '.json'
-  return input_path.with_suffix(suffix)
+def make_output(output: dict, in_path: Path, subtitle_type: str | None, save: bool = True):
+  def _save(out, suffix: str|None):
+    if not save:
+      return
+    if suffix is not None:
+      p = in_path.with_suffix(f'.{suffix}')
+    with p.open('w', encoding='utf-8') as f:
+      if isinstance(out, Iterator):
+        for o in out:
+          f.write(o)
+      else:
+        f.write(out)
+    print('[Save]', p.as_posix())
 
+  stypes = set([] if subtitle_type is None else subtitle_type.split('|'))
+  result = []
+  if len(stypes) == 0 or 'raw' in stypes:
+    ret = json.dumps(output, ensure_ascii=False, indent=2)
+    result.append(ret)
+    _save(ret, 'json')
+    stypes.discard('raw')
 
-def save_output(result: dict, path: Path, subtitle_type: str | None):
-  if subtitle_type:
-    ret = build_subtitle(str(result), 'funasr-nano', subtitle_type)
-  else:
-    ret = json.dumps(result, ensure_ascii=False, indent=2)
-    
-  with path.open('w', encoding='utf-8') as f:
-    f.write(ret)
-  print('[Save]', path.as_posix())
+  for s in stypes:
+    ret = build_subtitle(str(output), 'funasr-nano', s, True)
+    result.append(ret)
+    _save(ret, s)
+
+  return result
 
 
 def main(args):
@@ -123,14 +139,11 @@ def main(args):
   )
   mname = model.stem if isinstance(model, Path) else model
   model_output = run(model, mname, args.input, vad_model_dir)
-  results = []
+  results: list[str | Iterator[str]] = []
   for i, o in zip(args.input, model_output):
-    out_path = output_path_for(i, stype)
-    # 保存原始输出
-    # save_output(o, out_path, stype, None)
     # 保存原始/字幕输出
-    r = save_output(o, out_path, stype, args.save_to_file)
-    results.append(r)
+    r = make_output(o, i, stype, args.save_to_file)
+    results.extend(r)
 
   if args.save_to_file:
     return
@@ -138,8 +151,15 @@ def main(args):
   for i, content in enumerate(results):
     if i > 0:
       print()
-    print(f'[{i}]', content, end='')
-    if not content.endswith('\n'):
+    print(f'[{i}]')
+    final_chunk = content
+    if isinstance(content, Iterator):
+      for c in content:
+        print(c, end='')
+        final_chunk = c
+    else:
+      print(content, end='')
+    if not final_chunk.endswith('\n'):
       print()
 
 

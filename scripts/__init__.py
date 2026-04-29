@@ -25,10 +25,10 @@ def parse_transcribe_args():
     '-s',
     '--subtitle-type',
     type=str,
-    choices=['srt', 'ass'],
+    # choices=['srt', 'ass'],
     required=False,
     default=None,
-    help='subtitle output type; when omitted, keep original model output',
+    help='subtitle output type; when omitted, keep original model output. allow union [srt, ass, srt|raw, ass|raw]',
   )
   parser.add_argument(
     '--save-to-file',

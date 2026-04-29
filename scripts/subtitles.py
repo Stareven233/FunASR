@@ -9,6 +9,7 @@ python scripts/subtitles.py -t funasr-nano -s srt -p xxx.txt
 python scripts/subtitles.py -t funasr-nano -s ass -p xxx.txt
 
 uv run scripts/subtitles.py --type funasr-nano --subtitle-type srt --input "{'key': 'output', 'text': '首先解压下载的压缩包。 然后', 'text_tn': '首先解压下载的压缩包 sil 然后', 'label': 'null', 'ctc_text': '首先解压下载的压缩包  然后', 'ctc_timestamps': [{'token': '首', 'start_time': 1.26, 'end_time': 1.32, 'score': 0.998}, {'token': '先', 'start_time': 1.44, 'end_time': 1.5, 'score': 1.0}, {'token': '解', 'start_time': 1.62, 'end_time': 1.68, 'score': 0.999}, {'token': '压', 'start_time': 1.8, 'end_time': 1.86, 'score': 0.991}, {'token': '下', 'start_time': 2.04, 'end_time': 2.1, 'score': 1.0}, {'token': '载', 'start_time': 2.16, 'end_time': 2.22, 'score': 1.0}, {'token': '的', 'start_time': 2.28, 'end_time': 2.34, 'score': 0.64}, {'token': '压', 'start_time': 2.46, 'end_time': 2.52, 'score': 0.993}, {'token': '缩', 'start_time': 2.64, 'end_time': 2.7, 'score': 0.986}, {'token': '包', 'start_time': 2.82, 'end_time': 2.88, 'score': 0.999}, {'token': ' ', 'start_time': 3.18, 'end_time': 3.3, 'score': 0.946}, {'token': ' ', 'start_time': 8.52, 'end_time': 8.58, 'score': 0.706}, {'token': '然', 'start_time': 9.0, 'end_time': 9.06, 'score': 0.997}, {'token': '后', 'start_time': 9.12, 'end_time': 9.18, 'score': 0.991}]}"
+uv run scripts/subtitles.py --type funasr-nano --subtitle-type srt --path "D:/Document/Video/leafflow/vocal/output.json"
 '''
 import ast
 import re
@@ -128,18 +129,18 @@ class SRT_Resolver:
   def format_pre(self):
     return ''
 
-  def format_line(self, st, et, text):
-    return f'{self.time_format.format(*st, *et)}\n{text}\n\n'
+  def format_line(self, i, st, et, text):
+    return f'{i}\n{self.time_format.format(*st, *et)}\n{text}\n\n'
 
   def format_post(self):
     return ''
 
   def __call__(self):
     yield self.format_pre()
-    for (st, et, text) in self.timelines:
+    for i, (st, et, text) in enumerate(self.timelines):
       st = self.format_seconds(st)
       et = self.format_seconds(et)
-      yield self.format_line(st, et, text)
+      yield self.format_line(i, st, et, text)
     yield self.format_post()
 
 
@@ -172,7 +173,7 @@ class ASS_Resolver(SRT_Resolver):
       Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     '''.replace('  ', '')
 
-  def format_line(self, st, et, text):
+  def format_line(self, i, st, et, text):
     time = f'{self.time_format.format(*st, *et)}'
     return f'Dialogue: 0,{time},DS,,0,0,0,,{text}\n'
 
@@ -183,6 +184,7 @@ def parse_args():
   parser.add_argument('--input', '-i', help='input transcript string', type=str, default=None)
   parser.add_argument('--type', '-t', help='input transcript type', choices=['whisper', 'funasr-nano'], type=str, default='whisper')
   parser.add_argument('--subtitle-type', '-s', help='subtitle output type', choices=['srt', 'ass'], type=str, default='srt')
+  parser.add_argument('--save', help='save', action='store_true')
   args = parser.parse_args()
   return args
 
@@ -227,12 +229,13 @@ if __name__ == '__main__':
     [32.14s -> 32.36s] ドン!
   '''
 
-  if path is None:
-    subtitle = run(content, input_type=input_type, subtitle_type=subtitle_type)
-    print(subtitle, end='')
-  else:
+  subtitle = run(content, input_type=input_type, subtitle_type=subtitle_type, stream=True)
+  if path is not None and args.save:
     output_path = path.with_suffix(f'.{subtitle_type}')
     with output_path.open('w', encoding='utf-8') as f:
-      for chunk in tqdm(run(content, input_type=input_type, subtitle_type=subtitle_type, stream=True)):
+      for chunk in tqdm(subtitle):
         f.write(chunk)
     print(f'{f.name} saved')
+  else:
+    for s in subtitle:
+      print(s, end='')
