@@ -77,15 +77,20 @@ def run(model, mname, inputs:list[Path|str], vad_model=None):
   # print(text)
 
 
-def build_output(result: dict, subtitle_type: str | None):
-  if subtitle_type:
-    return build_subtitle(str(result), input_type='funasr-nano', subtitle_type=subtitle_type)
-  return json.dumps(result, ensure_ascii=False, indent=2)
-
-
 def output_path_for(input_path: Path, subtitle_type: str | None):
   suffix = f'.{subtitle_type}' if subtitle_type else '.json'
   return input_path.with_suffix(suffix)
+
+
+def save_output(result: dict, path: Path, subtitle_type: str | None):
+  if subtitle_type:
+    ret = build_subtitle(str(result), 'funasr-nano', subtitle_type)
+  else:
+    ret = json.dumps(result, ensure_ascii=False, indent=2)
+    
+  with path.open('w', encoding='utf-8') as f:
+    f.write(ret)
+  print('[Save]', path.as_posix())
 
 
 def main(args):
@@ -99,6 +104,7 @@ def main(args):
   merge_vad: 是否将 vad 模型切割的短音频碎片合成，合并后长度为merge_length_s，单位为秒s。
   ban_emo_unk: 禁用emo_unk标签，禁用后所有的句子都会被赋与情感标签。
   '''
+  stype = args.subtitle_type
   model = args.model_name
   if not model:
     model = 'funasrNano2512'
@@ -116,15 +122,17 @@ def main(args):
     # hub：download models from ms (for ModelScope) or hf (for Hugging Face).
   )
   mname = model.stem if isinstance(model, Path) else model
-  ret = run(model, mname, args.input, vad_model_dir)
-  results = [build_output(r, args.subtitle_type) for r in ret]
+  model_output = run(model, mname, args.input, vad_model_dir)
+  results = []
+  for i, o in zip(args.input, model_output):
+    out_path = output_path_for(i, stype)
+    # 保存原始输出
+    # save_output(o, out_path, stype, None)
+    # 保存原始/字幕输出
+    r = save_output(o, out_path, stype, args.save_to_file)
+    results.append(r)
 
   if args.save_to_file:
-    for input_path, content in zip(args.input, results):
-      output_path = output_path_for(input_path, args.subtitle_type)
-      with output_path.open('w', encoding='utf-8') as f:
-        f.write(content)
-      print('[Save]', output_path.as_posix())
     return
 
   for i, content in enumerate(results):

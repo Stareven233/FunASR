@@ -18,9 +18,19 @@ from pathlib import Path
 
 
 class SRT_Resolver:
-  def __init__(self, content: str, title='', input_type='whisper') -> None:
+  def __init__(
+    self,
+    content: str,
+    title='',
+    input_type='whisper',
+    max_sentence_duration: float = 3.5,
+    max_sentence_length: int = 24,
+  ) -> None:
     self.title = title
     self.input_type = input_type
+    # 超出改间隔、且超出限制长度将被截断
+    self.max_sentence_duration = max_sentence_duration
+    self.max_sentence_length = max_sentence_length
     self.time_format = r'{:02}:{:02}:{:02},{:03} --> {:02}:{:02}:{:02},{:03}'
     self.timelines: list[tuple]
     self.resolve_pattern = re.compile(r'\[(\d+\.\d+)s\s->\s(\d+\.\d+)s\]\s+(.+)')
@@ -50,9 +60,9 @@ class SRT_Resolver:
       timelines.append(m.groups())
     return timelines
 
-  @staticmethod
-  def split_funasr_nano_sentences(text: str, timestamps: list[dict]):
+  def split_funasr_nano_sentences(self, text: str, timestamps: list[dict]):
     sentence_endings = set('。！？!?；;')
+    split_punctuation = set('，,。.')
     punctuation = sentence_endings | set('，、：“”‘’（）()《》【】…,.')
     tokens = [token for token in timestamps if token.get('token', '').strip()]
     token_index = 0
@@ -60,6 +70,15 @@ class SRT_Resolver:
     sentence_start = None
     sentence_end = None
     timelines = []
+
+    def flush_sentence():
+      nonlocal sentence_chars, sentence_start, sentence_end
+      sentence = ''.join(sentence_chars).strip()
+      if sentence and sentence_start is not None and sentence_end is not None:
+        timelines.append((sentence_start, sentence_end, sentence))
+      sentence_chars = []
+      sentence_start = None
+      sentence_end = None
 
     for ch in text:
       sentence_chars.append(ch)
@@ -71,17 +90,21 @@ class SRT_Resolver:
         if sentence_start is None:
           sentence_start = token['start_time']
         sentence_end = token['end_time']
-      if ch in sentence_endings:
-        sentence = ''.join(sentence_chars).strip()
-        if sentence and sentence_start is not None and sentence_end is not None:
-          timelines.append((sentence_start, sentence_end, sentence))
-        sentence_chars = []
-        sentence_start = None
-        sentence_end = None
 
-    sentence = ''.join(sentence_chars).strip()
-    if sentence and sentence_start is not None and sentence_end is not None:
-      timelines.append((sentence_start, sentence_end, sentence))
+      sentence = ''.join(sentence_chars).strip()
+      sentence_duration = 0 if sentence_start is None or sentence_end is None else sentence_end - sentence_start
+      if ch in sentence_endings:
+        flush_sentence()
+      elif (
+        ch in split_punctuation
+        and sentence_start is not None
+        and sentence_end is not None
+        and sentence_duration > self.max_sentence_duration
+        and len(sentence) > self.max_sentence_length
+      ):
+        flush_sentence()
+
+    flush_sentence()
     return timelines
 
   def resolve_funasr_nano(self, content: str):
@@ -89,7 +112,7 @@ class SRT_Resolver:
     timelines = []
     text = item.get('text', '')
     # 启用VAD时有timestamps，会考虑分片的时间连续，此时ctc_timestamps是错的，分片间时间会重置
-    timestamps = item.get('timestamps', item.get('ctc_timestamps', []))
+    timestamps = item.get('timestamps', None) or item.get('ctc_timestamps', [])
     timelines.extend(self.split_funasr_nano_sentences(text, timestamps))
     return timelines
 
@@ -121,8 +144,15 @@ class SRT_Resolver:
 
 
 class ASS_Resolver(SRT_Resolver):
-  def __init__(self, content: str, title='', input_type='whisper') -> None:
-    super().__init__(content, title, input_type)
+  def __init__(
+    self,
+    content: str,
+    title='',
+    input_type='whisper',
+    max_sentence_duration: float = 3.5,
+    max_sentence_length: int = 24,
+  ) -> None:
+    super().__init__(content, title, input_type, max_sentence_duration, max_sentence_length)
     self.time_format = r'{:01}:{:02}:{:02}.{:02},{:01}:{:02}:{:02}.{:02}'
 
   def format_pre(self):
@@ -157,9 +187,19 @@ def parse_args():
   return args
 
 
-def run(content: str, input_type: str, subtitle_type: str, stream: bool = False) -> str | Iterator[str]:
+def run(
+  content: str,
+  input_type: str,
+  subtitle_type: str,
+  stream: bool = False,
+) -> str | Iterator[str]:
   resolver_cls = dict(srt=SRT_Resolver, ass=ASS_Resolver).get(subtitle_type.lower(), SRT_Resolver)
-  resolver = resolver_cls(content, input_type=input_type.lower())
+  resolver = resolver_cls(
+    content,
+    input_type=input_type.lower(),
+    max_sentence_duration=3.5,
+    max_sentence_length=24,
+  )
   chunks = resolver()
   if stream:
     return chunks
