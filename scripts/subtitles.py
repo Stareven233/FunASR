@@ -9,7 +9,7 @@ python scripts/subtitles.py -t funasr-nano -s srt -p xxx.txt
 python scripts/subtitles.py -t funasr-nano -s ass -p xxx.txt
 
 uv run scripts/subtitles.py --type funasr-nano --subtitle-type srt --input "{'key': 'output', 'text': '首先解压下载的压缩包。 然后', 'text_tn': '首先解压下载的压缩包 sil 然后', 'label': 'null', 'ctc_text': '首先解压下载的压缩包  然后', 'ctc_timestamps': [{'token': '首', 'start_time': 1.26, 'end_time': 1.32, 'score': 0.998}, {'token': '先', 'start_time': 1.44, 'end_time': 1.5, 'score': 1.0}, {'token': '解', 'start_time': 1.62, 'end_time': 1.68, 'score': 0.999}, {'token': '压', 'start_time': 1.8, 'end_time': 1.86, 'score': 0.991}, {'token': '下', 'start_time': 2.04, 'end_time': 2.1, 'score': 1.0}, {'token': '载', 'start_time': 2.16, 'end_time': 2.22, 'score': 1.0}, {'token': '的', 'start_time': 2.28, 'end_time': 2.34, 'score': 0.64}, {'token': '压', 'start_time': 2.46, 'end_time': 2.52, 'score': 0.993}, {'token': '缩', 'start_time': 2.64, 'end_time': 2.7, 'score': 0.986}, {'token': '包', 'start_time': 2.82, 'end_time': 2.88, 'score': 0.999}, {'token': ' ', 'start_time': 3.18, 'end_time': 3.3, 'score': 0.946}, {'token': ' ', 'start_time': 8.52, 'end_time': 8.58, 'score': 0.706}, {'token': '然', 'start_time': 9.0, 'end_time': 9.06, 'score': 0.997}, {'token': '后', 'start_time': 9.12, 'end_time': 9.18, 'score': 0.991}]}"
-uv run scripts/subtitles.py --type funasr-nano --subtitle-type srt --path "D:/Document/Video/leafflow/vocal/output.json"
+uv run scripts/subtitles.py --type funasr-nano --subtitle-type srt --path "D:/Document/Video/leafflow/vocal/output.json" --save
 '''
 import ast
 import re
@@ -64,48 +64,54 @@ class SRT_Resolver:
   def split_funasr_nano_sentences(self, text: str, timestamps: list[dict]):
     sentence_endings = set('。！？!?；;')
     split_punctuation = set('，,。.')
-    punctuation = sentence_endings | set('，、：“”‘’（）()《》【】…,.')
-    tokens = [token for token in timestamps if token.get('token', '').strip()]
-    token_index = 0
-    sentence_chars = []
-    sentence_start = None
-    sentence_end = None
+
+    if not timestamps:
+      return [(0, 0, text)]
+
     timelines = []
+    group = []
 
-    def flush_sentence():
-      nonlocal sentence_chars, sentence_start, sentence_end
-      sentence = ''.join(sentence_chars).strip()
-      if sentence and sentence_start is not None and sentence_end is not None:
-        timelines.append((sentence_start, sentence_end, sentence))
-      sentence_chars = []
-      sentence_start = None
-      sentence_end = None
+    def _start_time(tokens):
+      for t in tokens:
+        tt = t.get('token', '').strip()
+        if tt and tt not in sentence_endings | split_punctuation:
+          return t.get('start_time')
+      return tokens[0].get('start_time', 0) if tokens else 0
 
-    for ch in text:
-      sentence_chars.append(ch)
-      if (not ch.isspace()) and (ch not in punctuation):
-        if token_index >= len(tokens):
-          continue
-        token = tokens[token_index]
-        token_index += 1
-        if sentence_start is None:
-          sentence_start = token['start_time']
-        sentence_end = token['end_time']
+    def _end_time(tokens):
+      for t in reversed(tokens):
+        tt = t.get('token', '').strip()
+        if tt and tt not in sentence_endings | split_punctuation:
+          return t.get('end_time')
+      return tokens[-1].get('end_time', 0) if tokens else 0
 
-      sentence = ''.join(sentence_chars).strip()
-      sentence_duration = 0 if sentence_start is None or sentence_end is None else sentence_end - sentence_start
-      if ch in sentence_endings:
-        flush_sentence()
-      elif (
-        ch in split_punctuation
-        and sentence_start is not None
-        and sentence_end is not None
-        and sentence_duration > self.max_sentence_duration
-        and len(sentence) > self.max_sentence_length
-      ):
-        flush_sentence()
+    def _flush():
+      nonlocal group
+      if not group:
+        return
+      st = _start_time(group)
+      et = _end_time(group)
+      s = ''.join(t.get('token', '') for t in group).strip()
+      if s:
+        timelines.append((st, et, s))
+      group = []
 
-    flush_sentence()
+    for token in timestamps:
+      group.append(token)
+      t_text = token.get('token', '').strip()
+
+      if t_text in sentence_endings:
+        _flush()
+      elif t_text in split_punctuation and len(group) > 1:
+        st = _start_time(group[:-1])
+        et = _end_time(group[:-1])
+        if st is not None and et is not None:
+          if (et - st) > self.max_sentence_duration:
+            s = ''.join(t.get('token', '') for t in group).strip()
+            if len(s) > self.max_sentence_length:
+              _flush()
+
+    _flush()
     return timelines
 
   def resolve_funasr_nano(self, content: str):

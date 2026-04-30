@@ -29,7 +29,8 @@ from scripts.subtitles import run as build_subtitle
 
 
 model_dir = ROOT / 'model_zoo/models'
-vad_model_dir = model_dir / 'speech_fsmn_vad_zh-cn-16k-common-pytorch'
+# vad_model_dir = model_dir / 'speech_fsmn_vad_zh-cn-16k-common-pytorch'
+vad_model_dir = 'fsmn-vad'
 os.environ['MODELSCOPE_CACHE'] = model_dir.parent.as_posix()
 
 
@@ -59,7 +60,7 @@ def run(model, mname, inputs:list[Path|str], vad_model=None):
     # input=f'D:/Document/Audio/rie.aac',
     # input=f'https://isv-data.oss-cn-hangzhou.aliyuncs.com/ics/MaaS/ASR/test_audio/asr_example_zh.wav',
     cache={},
-    hotwords=['leaf'],
+    # hotwords=['leaf'],
     batch_size=1,
     itn=True,
     # Fun-ASR-Nano-2512: 中文、英文、日文
