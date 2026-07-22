@@ -12,6 +12,7 @@ dependencies = [
     "modelscope>=1.36.2",
     "numpy>=2.0.2",
     "omegaconf>=2.3.0",
+    "rapidfuzz>=3.13.0",
     "sentencepiece>=0.2.1",
     "six>=1.17.0",
     "torch-complex>=0.4.4",

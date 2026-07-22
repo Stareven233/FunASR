@@ -31,6 +31,25 @@ def parse_transcribe_args():
     help='subtitle output type; when omitted, keep original model output. allow union [srt, ass, srt|raw, ass|raw]',
   )
   parser.add_argument(
+    '-l',
+    '--language',
+    type=str,
+    default='auto',
+    help="recognition language (default: auto). e.g. auto / 中文 / ja / en; mix-language video should keep auto",
+  )
+  parser.add_argument(
+    '--vad',
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help='enable VAD for long audio (default: on). short clips can use --no-vad to skip VAD',
+  )
+  parser.add_argument(
+    '--title',
+    type=str,
+    default='',
+    help='subtitle metadata title (mainly for ASS Script Info Title)',
+  )
+  parser.add_argument(
     '--save-to-file',
     action='store_true',
     default=True,
