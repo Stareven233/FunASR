@@ -17,3 +17,6 @@ dependencies = [
     "torch-complex>=0.4.4",
     "transformers>=4.57.6",
 ]
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

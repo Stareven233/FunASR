@@ -15,9 +15,16 @@ from funasr.register import tables
 from funasr.train_utils.device_funcs import force_gatherable, to_device
 from funasr.utils.datadir_writer import DatadirWriter
 from funasr.utils.load_utils import extract_fbank, load_audio_text_image_video
-from transformers import AutoConfig, AutoModelForCausalLM
 
+try:
+    from transformers import AutoConfig, AutoModelForCausalLM
+except ImportError:
+    AutoConfig = None
+    AutoModelForCausalLM = None
+
+from funasr.models.fun_asr_nano.checkpoint_utils import disable_incomplete_ctc, normalize_checkpoint_state
 from funasr.models.fun_asr_nano.ctc import CTC
+from funasr.models.fun_asr_nano.device_utils import resolve_autocast_device_type
 from funasr.models.fun_asr_nano.tools.utils import forced_align
 
 dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -25,6 +32,27 @@ dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float3
 
 @tables.register("model_classes", "FunASRNano")
 class FunASRNano(nn.Module):
+    """Fun-ASR-Nano: End-to-End ASR Large Model.
+
+    Trained on tens of millions of hours of real speech data.
+    Language coverage is checkpoint-specific: Nano supports Chinese, English,
+    and Japanese plus Chinese dialects/accents; MLT-Nano supports 31 languages.
+
+    Features:
+    - Character-level timestamps (via CTC forced alignment)
+    - Hotword customization
+    - Speaker diarization (when combined with spk_model)
+    - Lyrics and rap recognition
+    - Streaming chunk-by-chunk inference (demo2.py)
+
+    Output: {"key": ..., "text": ..., "timestamps": [{"token", "start_time", "end_time"}, ...],
+             "ctc_timestamps": [...]}
+
+    Note: Outputs punctuation natively — punc_model is NOT needed.
+
+    Requirements: pip install tiktoken huggingface_hub
+    """
+
     def __init__(
         self,
         audio_encoder: str = None,
@@ -37,6 +65,19 @@ class FunASRNano(nn.Module):
         length_normalized_loss: bool = False,
         **kwargs,
     ):
+        """Initialize FunASRNano.
+        
+            Args:
+                audio_encoder: TODO.
+                audio_encoder_conf: Configuration dict for audio_encoder.
+                audio_adaptor: TODO.
+                audio_adaptor_conf: Configuration dict for audio_adaptor.
+                llm: TODO.
+                llm_conf: Configuration dict for llm.
+                input_size: Size/dimension parameter.
+                length_normalized_loss: TODO.
+                **kwargs: Additional keyword arguments.
+            """
         super().__init__()
 
         # audio encoder
@@ -107,6 +148,7 @@ class FunASRNano(nn.Module):
 
         # ctc decoder
         self.ctc_decoder = None
+        self._externally_loaded_ctc_keys = set()
         # TODO: fix table name
         ctc_decoder_class = tables.adaptor_classes.get(kwargs.get("ctc_decoder", None))
         if ctc_decoder_class is not None:
@@ -124,7 +166,7 @@ class FunASRNano(nn.Module):
                 ctc_tokenizer_class = tables.tokenizer_classes.get(ctc_tokenizer)
                 ctc_tokenizer = ctc_tokenizer_class(**ctc_tokenizer_conf)
                 self.ctc_tokenizer = ctc_tokenizer
-            assert ctc_tokenizer is not None, f"ctc_tokenizer must be set"
+            assert ctc_tokenizer is not None, "ctc_tokenizer must be set"
 
             ctc_vocab_size = kwargs.get("ctc_vocab_size", 60515)
             ctc_decoder_conf = kwargs.get("ctc_decoder_conf", {})
@@ -133,8 +175,15 @@ class FunASRNano(nn.Module):
             self.ctc_decoder = ctc_decoder_class(**ctc_decoder_conf)
             init_param_path = ctc_decoder_conf.get("init_param_path", None)
             if init_param_path is not None:
-                src_state = torch.load(init_param_path, map_location="cpu")
+                src_state = normalize_checkpoint_state(
+                    torch.load(init_param_path, map_location="cpu")
+                )
                 flag = self.ctc_decoder.load_state_dict(src_state, strict=False)
+                self._externally_loaded_ctc_keys.update(
+                    f"ctc_decoder.{key}"
+                    for key in self.ctc_decoder.state_dict()
+                    if key in src_state
+                )
                 logging.info(f"Loading ctc_decoder ckpt: {init_param_path}, status: {flag}")
             freeze = ctc_decoder_conf.get("freeze", False)
             if freeze:
@@ -158,6 +207,11 @@ class FunASRNano(nn.Module):
         rank = int(os.environ.get("RANK", 0))
         logging.info(f"rank: {rank}, model is builded.")
 
+    def on_pretrained_model_loaded(self, loaded_keys):
+        """Fail closed when a checkpoint configures CTC without trained weights."""
+        loaded_keys = set(loaded_keys).union(getattr(self, "_externally_loaded_ctc_keys", ()))
+        disable_incomplete_ctc(self, loaded_keys, log=logging)
+
     def forward(
         self,
         speech: torch.Tensor = None,
@@ -169,6 +223,18 @@ class FunASRNano(nn.Module):
         fbank_mask: torch.Tensor = None,
         **kwargs,
     ):
+        """Forward pass for training.
+        
+            Args:
+                speech: Speech audio tensor, shape (batch, time).
+                speech_lengths: Length of each speech sample.
+                input_ids: TODO.
+                attention_mask: TODO.
+                labels_ids: TODO.
+                fbank_beg: TODO.
+                fbank_mask: TODO.
+                **kwargs: Additional keyword arguments.
+            """
         batch_size, token_num = input_ids.shape
         stats = {}
         input_ids[input_ids < 0] = 0
@@ -230,9 +296,9 @@ class FunASRNano(nn.Module):
             stats["batch_size_real_frames"] = speech_lengths.sum().item()
             stats["padding_frames"] = stats["batch_size_x_frames"] - stats["batch_size_real_frames"]
 
-        device_type = next(self.parameters()).device.type
+        autocast_device_type = resolve_autocast_device_type(next(self.parameters()).device)
         with torch.autocast(
-            device_type=device_type if device_type in ["cuda", "xpu", "mps"] else "cpu",
+            device_type=autocast_device_type,
             enabled=True if self.llm_dtype != "fp32" else False,
             dtype=dtype_map[self.llm_dtype],
         ):
@@ -270,17 +336,35 @@ class FunASRNano(nn.Module):
         return loss, stats, weight
 
     def forward_export(self, speech, speech_lengths, **kwargs):
+        """Forward export.
+        
+            Args:
+                speech: Speech audio tensor, shape (batch, time).
+                speech_lengths: Length of each speech sample.
+                **kwargs: Additional keyword arguments.
+            """
         x, olens = self.audio_encoder(speech, speech_lengths)
         encoder_out, encoder_out_lens = self.audio_adaptor(x, olens)
         return encoder_out, encoder_out_lens
 
     def encode(self, speech, speech_lengths):
         # audio encoder
+        """Encode.
+        
+            Args:
+                speech: Speech audio tensor, shape (batch, time).
+                speech_lengths: Length of each speech sample.
+            """
         encoder_out, encoder_out_lens = self.audio_encoder(speech, speech_lengths)
 
         return encoder_out, encoder_out_lens
 
     def data_template(self, data):
+        """Data template.
+        
+            Args:
+                data: TODO.
+            """
         system, user, assistant = [], [], []
         for i, item in enumerate(data):
             role = item["role"]
@@ -306,6 +390,15 @@ class FunASRNano(nn.Module):
         return contents
 
     def data_load_speech(self, contents: dict, tokenizer, frontend, meta_data={}, **kwargs):
+        """Data load speech.
+        
+            Args:
+                contents: TODO.
+                tokenizer: Tokenizer instance for text encoding/decoding.
+                frontend: Audio frontend for feature extraction.
+                meta_data: TODO.
+                **kwargs: Additional keyword arguments.
+            """
         system = contents["system"]
         user = contents["user"]
         assistant = contents["assistant"]
@@ -467,9 +560,19 @@ class FunASRNano(nn.Module):
         frontend=None,
         **kwargs,
     ):
+        """Inference prepare.
+        
+            Args:
+                data_in: Input data (audio samples, file paths, or text).
+                data_lengths: Lengths of each input sample in the batch.
+                key: Sample identifiers.
+                tokenizer: Tokenizer instance for text encoding/decoding.
+                frontend: Audio frontend for feature extraction.
+                **kwargs: Additional keyword arguments.
+            """
         meta_data = {}
 
-        if kwargs.get("batch_size", 1) > 1:
+        if len(data_in) > 1:
             raise NotImplementedError("batch decoding is not implemented")
 
         contents = self.data_template(data_in[0])
@@ -485,11 +588,11 @@ class FunASRNano(nn.Module):
                 encoder_out_lens = kwargs["audio_embedding_lens"]
             else:
                 speech_lengths = batch["speech_lengths"][:, 0]
-                # fp16
-                if kwargs.get("fp16", False):
-                    speech = speech.to(torch.float16)
-                elif kwargs.get("bf16", False):
-                    speech = speech.to(torch.bfloat16)
+                # NOTE: the audio encoder contains fp32-only ops, so casting its
+                # input to fp16/bf16 here raises a dtype mismatch. The encoder
+                # therefore always runs in fp32; low precision (fp16/bf16) is
+                # applied to the LLM decoder only. The audio embeddings are cast
+                # to the LLM dtype automatically when written into inputs_embeds.
                 # audio encoder
                 encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
@@ -548,9 +651,16 @@ class FunASRNano(nn.Module):
         return inputs_embeds, contents, batch, source_ids, meta_data
 
     def get_prompt(self, hotwords: list[str], language: str = None, itn: bool = True):
+        """Get prompt.
+        
+            Args:
+                hotwords: TODO.
+                language: Language identifier.
+                itn: TODO.
+            """
         if len(hotwords) > 0:
             hotwords = ", ".join(hotwords)
-            prompt = f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
+            prompt = "请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
             prompt += f"热词列表：[{hotwords}]\n"
         else:
             prompt = ""
@@ -563,6 +673,12 @@ class FunASRNano(nn.Module):
         return prompt + "："
 
     def generate_chatml(self, prompt: str, data: Union[str, torch.Tensor]):
+        """Generate chatml.
+        
+            Args:
+                prompt: TODO.
+                data: TODO.
+            """
         if isinstance(data, str):
             return [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -589,6 +705,16 @@ class FunASRNano(nn.Module):
         frontend=None,
         **kwargs,
     ):
+        """Run inference on input data.
+        
+            Args:
+                data_in: Input data (audio samples, file paths, or text).
+                data_lengths: Lengths of each input sample in the batch.
+                key: Sample identifiers.
+                tokenizer: Tokenizer instance for text encoding/decoding.
+                frontend: Audio frontend for feature extraction.
+                **kwargs: Additional keyword arguments.
+            """
         prompt = self.get_prompt(
             kwargs.get("hotwords", []), kwargs.get("language", None), kwargs.get("itn", True)
         )
@@ -609,6 +735,127 @@ class FunASRNano(nn.Module):
             **kwargs,
         )
 
+    def _inference_llm_batch(self, data_in, data_lengths, key, tokenizer, frontend, **kwargs):
+        """Batched LLM decoding for multiple VAD segments at once.
+
+        Builds each segment's inputs_embeds via the single-sample
+        inference_prepare, left-pads them into one batch, and runs a single
+        llm.generate. This greatly improves GPU utilization for the small LLM
+        decoder (the per-segment, batch_size=1 path underuses the GPU).
+        CTC timestamps are not produced in batched mode.
+        """
+        # normalize nested key (e.g. [[k1, k2, ...]]) like the single-sample path
+        if key is not None and len(key) > 0 and isinstance(key[0], (list, tuple)):
+            key = list(key[0])
+        embs = []
+        keys = []
+        for i, d in enumerate(data_in):
+            k_i = [key[i]] if key is not None and i < len(key) else None
+            emb_i, _c, _b, _s, _m = self.inference_prepare(
+                [d], data_lengths, k_i, tokenizer, frontend, **kwargs
+            )
+            embs.append(emb_i)
+            keys.append(key[i] if key is not None and i < len(key) else f"rand_{i}")
+
+        llm_dtype = kwargs.get("llm_dtype", "fp32")
+        if llm_dtype == "fp32":
+            llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
+            llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
+        dt = dtype_map[llm_dtype]
+        device = embs[0].device
+        self.llm = self.llm.to(dt)
+
+        B = len(embs)
+        D = embs[0].shape[-1]
+        Tmax = max(e.shape[1] for e in embs)
+        padded = torch.zeros(B, Tmax, D, device=device, dtype=dt)
+        attn = torch.zeros(B, Tmax, dtype=torch.long, device=device)
+        for i, e in enumerate(embs):
+            Ti = e.shape[1]
+            padded[i, Tmax - Ti :, :] = e[0].to(dt)  # left padding
+            attn[i, Tmax - Ti :] = 1
+
+        autocast_device_type = resolve_autocast_device_type(kwargs.get("device", "cuda"))
+        with torch.autocast(
+            device_type=autocast_device_type,
+            enabled=True if llm_dtype != "fp32" else False,
+            dtype=dt,
+        ):
+            # left padding requires explicit position_ids so each segment's real
+            # tokens get positions 0,1,2,... regardless of the padding length.
+            position_ids = attn.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attn == 0, 1)
+            generated_ids = self.llm.generate(
+                inputs_embeds=padded,
+                attention_mask=attn,
+                position_ids=position_ids,
+                max_new_tokens=kwargs.get("max_length", 512),
+                pad_token_id=(
+                    self.llm.config.pad_token_id
+                    if self.llm.config.pad_token_id is not None
+                    else self.llm.config.eos_token_id
+                ),
+                **kwargs.get("llm_kwargs", {}),
+            )
+        texts = tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=kwargs.get("skip_special_tokens", True)
+        )
+        results = []
+        for i, t in enumerate(texts):
+            t = kwargs.get("prev_text", "") + t
+            results.append(
+                {
+                    "key": keys[i],
+                    "text": re.sub(r"\s+", " ", t.replace("/sil", " ")),
+                    "text_tn": re.sub(r"[^\w\s\u3000\u4e00-\u9fff]+", "", t),
+                }
+            )
+        return results, {}
+
+    @staticmethod
+    def _slice_batch_value(value, index):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] > index:
+            return value[index : index + 1]
+        if isinstance(value, list) and len(value) > index:
+            return [value[index]]
+        if isinstance(value, tuple) and len(value) > index:
+            return (value[index],)
+        return value
+
+    @staticmethod
+    def _merge_inference_meta(target, source):
+        for name, value in source.items():
+            if isinstance(value, (int, float)):
+                target[name] = target.get(name, 0.0) + value
+            elif name not in target:
+                target[name] = value
+
+    def _inference_llm_ctc_sequential(
+        self, data_in, data_lengths, key, tokenizer, frontend, **kwargs
+    ):
+        """Run multi-segment input one segment at a time when CTC timestamps are active."""
+        if key is not None and len(key) > 0 and isinstance(key[0], (list, tuple)):
+            key = list(key[0])
+
+        results = []
+        meta_data = {}
+        for i, data_i in enumerate(data_in):
+            key_i = [key[i]] if key is not None and i < len(key) else None
+            data_lengths_i = self._slice_batch_value(data_lengths, i)
+            results_i, meta_i = self.inference_llm(
+                [data_i],
+                data_lengths=data_lengths_i,
+                key=key_i,
+                tokenizer=tokenizer,
+                frontend=frontend,
+                **kwargs,
+            )
+            results.extend(results_i)
+            self._merge_inference_meta(meta_data, meta_i)
+        return results, meta_data
+
     def inference_llm(
         self,
         data_in,
@@ -618,6 +865,27 @@ class FunASRNano(nn.Module):
         frontend=None,
         **kwargs,
     ):
+        """Inference llm.
+        
+            Args:
+                data_in: Input data (audio samples, file paths, or text).
+                data_lengths: Lengths of each input sample in the batch.
+                key: Sample identifiers.
+                tokenizer: Tokenizer instance for text encoding/decoding.
+                frontend: Audio frontend for feature extraction.
+                **kwargs: Additional keyword arguments.
+            """
+        # Only batch when CTC timestamps are not needed; the batched path does not
+        # produce ctc_timestamps, so fall back to the single-sample path when a CTC
+        # decoder is loaded (preserves timestamp behavior).
+        if len(data_in) > 1:
+            if self.ctc_decoder is None:
+                return self._inference_llm_batch(
+                    data_in, data_lengths, key, tokenizer, frontend, **kwargs
+                )
+            return self._inference_llm_ctc_sequential(
+                data_in, data_lengths, key, tokenizer, frontend, **kwargs
+            )
         inputs_embeds, contents, batch, source_ids, meta_data = self.inference_prepare(
             data_in, data_lengths, key, tokenizer, frontend, **kwargs
         )
@@ -649,9 +917,9 @@ class FunASRNano(nn.Module):
             llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
             llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
 
-        device_type = torch.device(kwargs.get("device", "cuda")).type
+        autocast_device_type = resolve_autocast_device_type(kwargs.get("device", "cuda"))
         with torch.autocast(
-            device_type=device_type if device_type in ["cuda", "xpu", "mps"] else "cpu",
+            device_type=autocast_device_type,
             enabled=True if llm_dtype != "fp32" else False,
             dtype=dtype_map[llm_dtype],
         ):
@@ -739,6 +1007,12 @@ class FunASRNano(nn.Module):
 
     @staticmethod
     def from_pretrained(model: str = None, **kwargs):
+        """From pretrained.
+        
+            Args:
+                model: Model instance or model name.
+                **kwargs: Additional keyword arguments.
+            """
         from funasr import AutoModel
 
         model, kwargs = AutoModel.build_model(model=model, trust_remote_code=True, **kwargs)
