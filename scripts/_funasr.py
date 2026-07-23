@@ -13,29 +13,58 @@ $audio = "D:/Document/Audio/!raw/篠宮ゆり.aac"
 # $audio = "D:/Document/ai-sings/Ending Note/Ending Note 門谷純_Vocals_vocals.flac"
 # $audio = "D:\Document\Video\leafflow\vocal\output.flac"
 # 💡 支持任意格式（mp4/aac/flac/mp3/m4a/wav…），FunASR 内部自动解码并重采样至 16kHz
+# VAD 开启时：按切片流式写 srt/ass（中途崩溃也不丢已识别部分）+ tqdm 进度
 uv run scripts/_funasr.py -m FunAudioLLM/Fun-ASR-Nano-2512 -i $audio -s "raw|srt"
 # 混合语种 / 日文视频：保持默认 language=auto；短音频可 --no-vad
-# uv run scripts/_funasr.py -m funasrNano2512 -i $audio -s "srt|ass" --title "篠宮ゆり"
+# 长音频加速：调大 --batch-size（默认 8）与 --batch-size-s（默认 60）
+# uv run scripts/_funasr.py -m funasrNano2512 -i $audio -s "srt|ass" --title "篠宮ゆり" --batch-size 16 --batch-size-s 120
 # uv run scripts/_funasr.py -m funasrNano2512 -i "D:/t/h/jrcr94_oc3G6e2Zh_2026-03-22_11-34-07.mp4" -s "srt" --no-vad
+
 '''
 
 import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Iterator
 
-from funasr import AutoModel
+# ── 缓存 / 日志：必须在 import funasr / huggingface 之前 ──────────
+# 注意：不能 from scripts import ROOT —— scripts/__init__.py 会立刻 import funasr
+_ROOT = Path(__file__).resolve().parent.parent
+model_dir = _ROOT / 'model_zoo/models'
+_cache_root = model_dir.parent  # model_zoo/
+os.environ['MODELSCOPE_CACHE'] = _cache_root.as_posix()
+# HuggingFace 与 ModelScope 共用 model_zoo 作为缓存根
+os.environ['HF_HOME'] = _cache_root.as_posix()
+os.environ['HF_HUB_CACHE'] = (_cache_root / 'hub').as_posix()
+os.environ['TRANSFORMERS_CACHE'] = (_cache_root / 'transformers').as_posix()
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+# 压掉 FunASR / transformers 的 INFO 刷屏；我们自己打印阶段进度
+logging.getLogger().setLevel(logging.WARNING)
+logging.getLogger('funasr').setLevel(logging.WARNING)
+logging.getLogger('modelscope').setLevel(logging.WARNING)
+logging.getLogger('transformers').setLevel(logging.ERROR)
 
 sys.path.append('.')
-from scripts import ROOT, parse_transcribe_args
-from scripts.subtitles import run as build_subtitle
+from funasr import AutoModel  # noqa: E402
+from funasr.utils.load_utils import load_audio_text_image_video  # noqa: E402
+from funasr.utils.vad_utils import merge_vad, slice_padding_audio_samples  # noqa: E402
+from scripts import ROOT, parse_transcribe_args  # noqa: E402
+from scripts.subtitles import ASS_Resolver, SRT_Resolver  # noqa: E402
+from scripts.subtitles import run as build_subtitle  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+# 与 scripts.ROOT 对齐（防御性：若相对路径解析不一致则用 scripts.ROOT）
+model_dir = ROOT / 'model_zoo/models'
 
 # ── 项目自定义配置 ──────────────────────────────────────────────────
-model_dir = ROOT / 'model_zoo/models'
-# vad_model_dir = model_dir / 'speech_fsmn_vad_zh-cn-16k-common-pytorch'
 DEFAULT_VAD_MODEL = 'fsmn-vad'
-os.environ['MODELSCOPE_CACHE'] = model_dir.parent.as_posix()
+# DEFAULT_VAD_MODEL = model_dir / 'iic/speech_fsmn_vad_zh-cn-16k-common-pytorch'
+MERGE_LENGTH_S = 15
+MAX_SINGLE_SEGMENT_MS = 30000
 
 model_mapping: dict[str, str] = {
     'sensevoice': 'SenseVoiceSmall',
@@ -44,43 +73,341 @@ model_mapping: dict[str, str] = {
     'funasrNanoMlt2512': 'FunAudioLLM/Fun-ASR-MLT-Nano-2512',
 }
 
+# generate / inference 共用参数（字幕时间戳必需）
+_ASR_GEN_KW = dict(
+    itn=True,
+    use_itn=True,
+    sentence_timestamp=True,
+    output_timestamp=True,
+    return_time_stamps=True,
+    disable_update=True,
+    no_speech_threshold=0.6,
+)
+
+
+# ── 字幕流式落盘 ──────────────────────────────────────────────────
+
+def _offset_result(result: dict, offset_ms: int) -> dict:
+    """把单段 ASR 相对时间戳平移到全曲绝对时间。"""
+    if not offset_ms:
+        return result
+    out = dict(result)
+    off_s = offset_ms / 1000.0
+
+    def _shift_pair(pair):
+        if isinstance(pair, dict):
+            t = dict(pair)
+            for sk, ek in (
+                ('start_time', 'end_time'),
+                ('start', 'end'),
+            ):
+                if sk in t and t[sk] is not None:
+                    v = float(t[sk])
+                    # Nano token 时间多为秒；毫秒级数值则按 ms 加
+                    t[sk] = v + (off_s if v < 1000 else offset_ms)
+                if ek in t and t[ek] is not None:
+                    v = float(t[ek])
+                    t[ek] = v + (off_s if v < 10000 else offset_ms)
+            return t
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            a, b = float(pair[0]), float(pair[1])
+            # list 格式官方按 ms
+            return [int(a) + offset_ms, int(b) + offset_ms, *pair[2:]]
+        return pair
+
+    for key in ('timestamp', 'timestamps', 'ctc_timestamps'):
+        if out.get(key):
+            out[key] = [_shift_pair(t) for t in out[key]]
+
+    if out.get('sentence_info'):
+        si = []
+        for seg in out['sentence_info']:
+            s = dict(seg)
+            if 'start' in s and s['start'] is not None:
+                s['start'] = int(s['start']) + offset_ms
+            if 'end' in s and s['end'] is not None:
+                s['end'] = int(s['end']) + offset_ms
+            if s.get('timestamp'):
+                s['timestamp'] = [_shift_pair(t) for t in s['timestamp']]
+            si.append(s)
+        out['sentence_info'] = si
+    return out
+
+
+def _merge_segment_results(segments: list[dict], key: str = '') -> dict:
+    """把流式分段结果合成一份完整 raw dict（给 json 输出）。"""
+    if not segments:
+        return {'key': key, 'text': '', 'timestamps': [], 'timestamp': []}
+    texts = []
+    timestamps = []
+    ctc_timestamps = []
+    timestamp = []
+    sentence_info = []
+    for seg in segments:
+        t = (seg.get('text') or '').strip()
+        if t:
+            texts.append(t)
+        if seg.get('timestamps'):
+            timestamps.extend(seg['timestamps'])
+        if seg.get('ctc_timestamps'):
+            ctc_timestamps.extend(seg['ctc_timestamps'])
+        if seg.get('timestamp'):
+            timestamp.extend(seg['timestamp'])
+        if seg.get('sentence_info'):
+            sentence_info.extend(seg['sentence_info'])
+    out = {
+        'key': key or segments[0].get('key', ''),
+        'text': ' '.join(texts),
+    }
+    if timestamps:
+        out['timestamps'] = timestamps
+    if ctc_timestamps:
+        out['ctc_timestamps'] = ctc_timestamps
+    if timestamp:
+        out['timestamp'] = timestamp
+    if sentence_info:
+        out['sentence_info'] = sentence_info
+    # 兼容字段
+    for k in ('text_tn', 'label', 'ctc_text'):
+        vals = [s[k] for s in segments if s.get(k)]
+        if vals:
+            out[k] = ' '.join(str(v) for v in vals)
+    return out
+
+
+class LiveSubtitleSink:
+    """
+    VAD 切片完成后立即追加写入字幕。
+    - srt/ass: 打开即写 header，每段 ASR 完就 flush 新 cue
+    - raw/json: 收齐后一次性写（结构完整）
+    中途崩溃时 srt/ass 已落盘的部分仍可播放。
+    """
+
+    def __init__(
+        self,
+        in_path: Path,
+        subtitle_type: str | None,
+        *,
+        title: str = '',
+        save: bool = True,
+    ):
+        self.in_path = Path(in_path)
+        self.save = save
+        self.title = title or self.in_path.stem
+        stypes = set([] if subtitle_type is None else subtitle_type.split('|'))
+        self.want_raw = len(stypes) == 0 or 'raw' in stypes
+        stypes.discard('raw')
+        self.sub_types = {s for s in stypes if s in ('srt', 'ass')}
+        # 未知类型仍走一次性 build
+        self.extra_types = stypes - self.sub_types
+
+        self._files: dict[str, object] = {}
+        self._index: dict[str, int] = {}  # 各字幕类型独立序号
+        self._resolvers: dict[str, SRT_Resolver] = {}
+        self.segments: list[dict] = []
+        self.cue_count = 0
+
+        if self.save:
+            for s in self.sub_types:
+                cls = ASS_Resolver if s == 'ass' else SRT_Resolver
+                # 空 content 只拿 format_pre / format_line
+                r = cls({}, title=self.title, input_type='funasr-nano')
+                r.timelines = []
+                self._resolvers[s] = r
+                self._index[s] = 0
+                p = self.in_path.with_suffix(f'.{s}')
+                f = p.open('w', encoding='utf-8')
+                pre = r.format_pre()
+                if pre:
+                    f.write(pre)
+                    f.flush()
+                self._files[s] = f
+                print(f'[Stream] open {p.as_posix()}')
+
+    def append_segment(self, result: dict):
+        """追加一段已做绝对时间偏移的 ASR 结果。"""
+        self.segments.append(result)
+        if not self.save or not self.sub_types:
+            return
+        # 只对第一种字幕类型计 cue，避免 srt|ass 双开时重复计数
+        counted = False
+        for s, resolver in self._resolvers.items():
+            lines = resolver.resolve_funasr_nano(result)
+            f = self._files[s]
+            n_written = 0
+            for st, et, text in lines:
+                if not text:
+                    continue
+                self._index[s] += 1
+                st_t = resolver.format_seconds(st)
+                et_t = resolver.format_seconds(et)
+                f.write(resolver.format_line(self._index[s], st_t, et_t, text))
+                n_written += 1
+            if not counted and n_written:
+                self.cue_count += n_written
+                counted = True
+            f.flush()
+
+    def finalize(self) -> dict:
+        """收尾：关字幕文件、写 raw json、处理未知类型。"""
+        for f in self._files.values():
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._files.clear()
+
+        merged = _merge_segment_results(self.segments, key=self.in_path.stem)
+        if self.save and self.want_raw:
+            p = self.in_path.with_suffix('.json')
+            p.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding='utf-8')
+            print(f'[Save] {p.as_posix()}  segments={len(self.segments)} cues={self.cue_count}')
+        for s in self.sub_types:
+            if self.save:
+                print(f'[Save] {self.in_path.with_suffix(f".{s}").as_posix()}  cues≈{self.cue_count}')
+        if self.save:
+            for s in self.extra_types:
+                ret = build_subtitle(merged, 'funasr-nano', s, False, title=self.title)
+                p = self.in_path.with_suffix(f'.{s}')
+                p.write_text(ret if isinstance(ret, str) else ''.join(ret), encoding='utf-8')
+                print(f'[Save] {p.as_posix()}')
+        return merged
+
+
 # ── 推理 ──────────────────────────────────────────────────────────
 
-def run(model, inputs: list[Path | str], *, language: str = 'auto', use_vad: bool = True):
-    """
-    调用模型生成识别结果。
-
-    整合了官方的改进：
-    - sentence_timestamp=True: 直接返回分句级别的结构化结果 (sentence_info)
-    - return_time_stamps=True:  返回逐句的时间戳
-    - disable_update=True:      关闭模型更新检查，减少噪音输出
-    - language 默认 auto:       混合语种更稳；单语种视频可显式指定
-    """
-    inputs: list[str] = [i.as_posix() if isinstance(i, Path) else i for i in inputs]
+def run_once(
+    model,
+    inputs: list[Path | str],
+    *,
+    language: str = 'auto',
+    batch_size: int = 8,
+    batch_size_s: int = 60,
+):
+    """无 VAD：整文件一次 generate（短音频 / --no-vad）。"""
+    inputs = [i.as_posix() if isinstance(i, Path) else i for i in inputs]
+    print(f'[ASR] start  files={len(inputs)} (no-vad) batch_size={batch_size}')
+    t0 = time.perf_counter()
     res = model.generate(
         input=inputs,
         cache={},
-        # hotwords=['leaf'],
-        batch_size=1,
-        itn=True,
-        # Fun-ASR-Nano-2512: 中文、英文、日文
-        # Fun-ASR-MLT-Nano-2512: 韩文、越南语、印尼语、泰国语、马来语、菲律宾语、阿拉伯语、印地语、保加利亚语、克罗地亚语、捷克语、丹麦语、荷兰语、爱沙尼亚语、芬兰语、希腊语、匈牙利语、爱尔兰语、拉脱维亚语、立陶宛语、马耳他语、波兰语、葡萄牙语、罗马尼亚语、斯洛伐克语、斯洛文尼亚语、瑞典语
-        language=language,  # 默认 auto；单语种可 --language 中文/ja/en
-        use_itn=True,
-        # 官方推荐参数
-        sentence_timestamp=True,
-        output_timestamp=True,
-        return_time_stamps=True,
-        batch_size_s=60,
-        merge_vad=bool(use_vad),
-        merge_length_s=15,
-        disable_update=True,
-        no_speech_threshold=0.6,
+        batch_size=batch_size,
+        batch_size_s=batch_size_s,
+        language=language,
+        merge_vad=False,
+        **_ASR_GEN_KW,
     )
+    print(f'[ASR] done   elapsed={time.perf_counter() - t0:.1f}s')
     return res
 
 
-# ── 输出处理 ──────────────────────────────────────────────────────
+def run_streaming_vad(
+    model,
+    in_path: Path,
+    *,
+    language: str = 'auto',
+    batch_size: int = 8,
+    batch_size_s: int = 60,
+    subtitle_type: str | None = None,
+    title: str = '',
+    save: bool = True,
+) -> dict:
+    """
+    自建 VAD → ASR 管线，按时间顺序处理切片，每完成一批就追加写字幕。
+
+    与官方 inference_with_vad 差异：
+    - 不按长度重排（保证写出顺序 = 时间顺序，便于实时预览）
+    - 用 tqdm 显示切片进度
+    - LiveSubtitleSink 实时 flush srt/ass
+    """
+    if model.vad_model is None:
+        raise RuntimeError('run_streaming_vad requires vad_model')
+
+    path_str = in_path.as_posix() if isinstance(in_path, Path) else str(in_path)
+    in_path = Path(path_str)
+    sink = LiveSubtitleSink(in_path, subtitle_type, title=title, save=save)
+
+    # ── 1) VAD ──
+    print(f'[VAD] {in_path.name} ...')
+    t_vad = time.perf_counter()
+    vad_out = model.inference(
+        path_str,
+        model=model.vad_model,
+        kwargs=model.vad_kwargs,
+    )
+    vad_segments = (vad_out[0].get('value') if vad_out else None) or []
+    if MERGE_LENGTH_S > 0 and vad_segments:
+        vad_segments = merge_vad(vad_segments, MERGE_LENGTH_S * 1000)
+    print(f'[VAD] done  segs={len(vad_segments)}  elapsed={time.perf_counter() - t_vad:.1f}s')
+
+    if not vad_segments:
+        print('[ASR] empty speech, skip')
+        return sink.finalize()
+
+    # ── 2) 加载整段音频 ──
+    fs = model.kwargs['frontend'].fs if hasattr(model.kwargs.get('frontend'), 'fs') else 16000
+    speech = load_audio_text_image_video(path_str, fs=fs, audio_fs=model.kwargs.get('fs', 16000))
+    speech_lengths = len(speech)
+    speech_s = speech_lengths / float(fs)
+
+    # ── 3) 按时间顺序动态打包（batch_size 段数上限 + batch_size_s 时长上限）──
+    pack_limit_ms = max(int(batch_size_s) * 1000, 1)
+    packs: list[list[tuple[list, int]]] = []  # each: [( [start_ms,end_ms], orig_idx ), ...]
+    cur: list[tuple[list, int]] = []
+    cur_ms = 0
+    for idx, seg in enumerate(vad_segments):
+        dur = int(seg[1]) - int(seg[0])
+        if cur and (len(cur) >= batch_size or cur_ms + dur > pack_limit_ms):
+            packs.append(cur)
+            cur, cur_ms = [], 0
+        cur.append((seg, idx))
+        cur_ms += dur
+    if cur:
+        packs.append(cur)
+
+    print(
+        f'[ASR] start  segs={len(vad_segments)} packs={len(packs)} '
+        f'audio={speech_s:.1f}s batch_size={batch_size} batch_size_s={batch_size_s}'
+    )
+    t_asr = time.perf_counter()
+    asr_cfg = dict(language=language, **_ASR_GEN_KW)
+
+    with tqdm(
+        total=len(vad_segments),
+        unit='seg',
+        desc='ASR',
+        dynamic_ncols=True,
+        mininterval=0.5,
+    ) as pbar:
+        for pack in packs:
+            speech_j, _ = slice_padding_audio_samples(speech, speech_lengths, pack)
+            # 让 inference 内部一次吃完整包，避免再被 batch_size=1 拆碎
+            results = model.inference(
+                speech_j,
+                input_len=None,
+                model=model.model,
+                kwargs=model.kwargs,
+                batch_size=max(len(speech_j), 1),
+                **asr_cfg,
+            )
+            if not results:
+                pbar.update(len(pack))
+                continue
+            for (seg, _), res in zip(pack, results):
+                offset_ms = int(seg[0])
+                res_abs = _offset_result(res, offset_ms)
+                sink.append_segment(res_abs)
+                snippet = (res_abs.get('text') or '').replace('\n', ' ').strip()
+                if len(snippet) > 24:
+                    snippet = snippet[:24] + '…'
+                pbar.set_postfix_str(snippet, refresh=False)
+                pbar.update(1)
+
+    elapsed = time.perf_counter() - t_asr
+    rtf = elapsed / speech_s if speech_s > 0 else 0.0
+    print(f'[ASR] done   elapsed={elapsed:.1f}s  rtf={rtf:.3f}  cues={sink.cue_count}')
+    return sink.finalize()
+
 
 def make_output(
     output: dict,
@@ -89,23 +416,18 @@ def make_output(
     save: bool = True,
     title: str = '',
 ):
-    """
-    保存 raw JSON / 字幕。
-    直接把原生 dict 交给 build_subtitle，避免 str(output) → literal_eval 的双重序列化。
-    sentence_info 缺失时的回退逻辑在 scripts/subtitles.py 内处理。
-    """
+    """无 VAD / 一次性结果：保存 raw JSON / 字幕。"""
     def _save(out, suffix: str | None):
-        if not save:
+        if not save or suffix is None:
             return
-        if suffix is not None:
-            p = in_path.with_suffix(f'.{suffix}')
-            with p.open('w', encoding='utf-8') as f:
-                if isinstance(out, Iterator):
-                    for o in out:
-                        f.write(o)
-                else:
-                    f.write(out)
-            print('[Save]', p.as_posix())
+        p = in_path.with_suffix(f'.{suffix}')
+        with p.open('w', encoding='utf-8') as f:
+            if isinstance(out, Iterator):
+                for o in out:
+                    f.write(o)
+            else:
+                f.write(out)
+        print('[Save]', p.as_posix())
 
     stypes = set([] if subtitle_type is None else subtitle_type.split('|'))
     result = []
@@ -115,13 +437,11 @@ def make_output(
         _save(ret, 'json')
     stypes.discard('raw')
 
-    # 默认标题：输入文件名（无扩展名），可用 --title 覆盖
     ass_title = title or in_path.stem
     for s in stypes:
         ret = build_subtitle(output, 'funasr-nano', s, True, title=ass_title)
         result.append(ret)
         _save(ret, s)
-
     return result
 
 
@@ -129,13 +449,9 @@ def make_output(
 
 def main(args):
     '''model_dir:      模型名称，或本地磁盘中的模型路径。
-    vad_model:       表示开启VAD，VAD的作用是将长音频切割成短音频，此时推理耗时包括了VAD与SenseVoice总耗时，为链路耗时，如果需要单独测试SenseVoice模型耗时，可以关闭VAD模型。
-    vad_kwargs:      表示VAD模型配置
-    max_single_segment_time: 表示vad_model最大切割音频时长, 单位是毫秒ms。
-    use_itn:         输出结果中是否包含标点与逆文本正则化。
-    batch_size_s:    表示采用动态batch，batch中总音频时长，单位为秒s。
-    merge_vad:       是否将 vad 模型切割的短音频碎片合成，合并后长度为merge_length_s，单位为秒s。
-    ban_emo_unk:     禁用emo_unk标签，禁用后所有的句子都会被赋与情感标签。
+    vad_model:       表示开启VAD，VAD的作用是将长音频切割成短音频。
+    batch_size:      ASR 每次送入的段数；流式 VAD 路径下也是每包段数上限。
+    batch_size_s:    动态 batch 总音频时长（秒）。
     '''
     stype = args.subtitle_type
     model = args.model_name
@@ -145,6 +461,8 @@ def main(args):
     use_vad = bool(getattr(args, 'vad', True))
     language = getattr(args, 'language', None) or 'auto'
     title = getattr(args, 'title', '') or ''
+    batch_size = max(1, int(getattr(args, 'batch_size', 8) or 8))
+    batch_size_s = max(1, int(getattr(args, 'batch_size_s', 60) or 60))
     vad_model = DEFAULT_VAD_MODEL if use_vad else None
 
     if model in model_mapping:
@@ -154,22 +472,52 @@ def main(args):
         model_name = model
         hub = 'hf' if 'Fun-ASR-Nano' in model else 'ms'
 
+    print(
+        f'[Config] language={language} vad={"on" if use_vad else "off"} '
+        f'stream={"on" if use_vad else "off"} '
+        f'batch_size={batch_size} batch_size_s={batch_size_s}s '
+        f'cache={os.environ["MODELSCOPE_CACHE"]}'
+    )
+    print('[Model] loading...')
+    t_load = time.perf_counter()
     model = AutoModel(
         model=model_name,
         vad_model=vad_model,
-        # 最大单段时长 30s
-        vad_kwargs={'max_single_segment_time': 30000} if vad_model else None,
+        vad_kwargs={'max_single_segment_time': MAX_SINGLE_SEGMENT_MS} if vad_model else None,
         device='cuda:0',
         trust_remote_code=True,
         hub=hub,
-        # FunASR 内部自动通过 ffmpeg 解码任意格式 (mp4/aac/flac/mp3 等) 并重采样至 16kHz，
-        # 无需事先用 ffmpeg 抽音频转采样率。
+        # 关掉 FunASR 内置 tqdm；我们自己用切片级进度条
+        disable_pbar=True,
+        disable_update=True,
+        log_level='ERROR',
     )
-    print(f'[Config] language={language} vad={"on" if use_vad else "off"}')
-    model_output = run(model, args.input, language=language, use_vad=use_vad)
+    print(f'[Model] ready  load={time.perf_counter() - t_load:.1f}s')
+
+    # 有 VAD：流式写字幕；无 VAD：整文件一次出结果
+    if use_vad and model.vad_model is not None:
+        for in_path in args.input:
+            run_streaming_vad(
+                model,
+                in_path,
+                language=language,
+                batch_size=batch_size,
+                batch_size_s=batch_size_s,
+                subtitle_type=stype,
+                title=title,
+                save=args.save_to_file,
+            )
+        return
+
+    model_output = run_once(
+        model,
+        args.input,
+        language=language,
+        batch_size=batch_size,
+        batch_size_s=batch_size_s,
+    )
     results: list[str | Iterator[str]] = []
     for i, o in zip(args.input, model_output):
-        # 保存原始/字幕输出；原生 dict 直传，避免 str 包装
         r = make_output(o, i, stype, args.save_to_file, title=title)
         results.extend(r)
 

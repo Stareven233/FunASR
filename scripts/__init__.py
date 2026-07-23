@@ -50,6 +50,18 @@ def parse_transcribe_args():
     help='subtitle metadata title (mainly for ASS Script Info Title)',
   )
   parser.add_argument(
+    '--batch-size',
+    type=int,
+    default=8,
+    help='ASR sample batch size (default: 8). With VAD, keep this high so packed segments are not re-sliced to 1; try 8/16',
+  )
+  parser.add_argument(
+    '--batch-size-s',
+    type=int,
+    default=60,
+    help='VAD dynamic-batch total speech duration in seconds (default: 60). Larger → fewer ASR calls, faster',
+  )
+  parser.add_argument(
     '--save-to-file',
     action='store_true',
     default=True,
