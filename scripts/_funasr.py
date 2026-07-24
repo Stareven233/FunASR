@@ -14,12 +14,14 @@ $audio = "D:/Document/Audio/!raw/篠宮ゆり.aac"
 # $audio = "D:\Document\Video\leafflow\vocal\output.flac"
 # 💡 支持任意格式（mp4/aac/flac/mp3/m4a/wav…），FunASR 内部自动解码并重采样至 16kHz
 # VAD 开启时：按切片流式写 srt/ass（中途崩溃也不丢已识别部分）+ tqdm 进度
+# 默认 cache-only（不联网校验/下载）；冷缓存请加 --allow-download
 uv run scripts/_funasr.py -m FunAudioLLM/Fun-ASR-Nano-2512 -i $audio -s "raw|srt"
 # 混合语种 / 日文视频：保持默认 language=auto；短音频可 --no-vad
 # 长音频加速：调大 --batch-size（默认 8）与 --batch-size-s（默认 60）
+# Nano 多段批处理：--nano-batch-mode timestamps|fast|sequential（默认 timestamps）
 # uv run scripts/_funasr.py -m funasrNano2512 -i $audio -s "srt|ass" --title "篠宮ゆり" --batch-size 16 --batch-size-s 120
 # uv run scripts/_funasr.py -m funasrNano2512 -i "D:/t/h/jrcr94_oc3G6e2Zh_2026-03-22_11-34-07.mp4" -s "srt" --no-vad
-
+# 首次拉模型：uv run scripts/_funasr.py -m funasrNano2512 -i $audio -s srt --allow-download
 '''
 
 import json
@@ -27,8 +29,8 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 # ── 缓存 / 日志：必须在 import funasr / huggingface 之前 ──────────
 # 注意：不能 from scripts import ROOT —— scripts/__init__.py 会立刻 import funasr
@@ -49,13 +51,14 @@ logging.getLogger('modelscope').setLevel(logging.WARNING)
 logging.getLogger('transformers').setLevel(logging.ERROR)
 
 sys.path.append('.')
-from funasr import AutoModel  # noqa: E402
-from funasr.utils.load_utils import load_audio_text_image_video  # noqa: E402
-from funasr.utils.vad_utils import merge_vad, slice_padding_audio_samples  # noqa: E402
-from scripts import ROOT, parse_transcribe_args  # noqa: E402
-from scripts.subtitles import ASS_Resolver, SRT_Resolver  # noqa: E402
-from scripts.subtitles import run as build_subtitle  # noqa: E402
-from tqdm import tqdm  # noqa: E402
+from tqdm import tqdm
+
+from funasr import AutoModel
+from funasr.utils.load_utils import load_audio_text_image_video
+from funasr.utils.vad_utils import merge_vad, slice_padding_audio_samples
+from scripts import ROOT, parse_transcribe_args
+from scripts.subtitles import ASS_Resolver, SRT_Resolver
+from scripts.subtitles import run as build_subtitle
 
 # 与 scripts.ROOT 对齐（防御性：若相对路径解析不一致则用 scripts.ROOT）
 model_dir = ROOT / 'model_zoo/models'
@@ -73,16 +76,69 @@ model_mapping: dict[str, str] = {
     'funasrNanoMlt2512': 'FunAudioLLM/Fun-ASR-MLT-Nano-2512',
 }
 
-# generate / inference 共用参数（字幕时间戳必需）
-_ASR_GEN_KW = dict(
-    itn=True,
-    use_itn=True,
-    sentence_timestamp=True,
-    output_timestamp=True,
-    return_time_stamps=True,
-    disable_update=True,
-    no_speech_threshold=0.6,
-)
+# generate / inference 共用参数（字幕时间戳必需；fast 模式会去掉时间戳类 flag）
+_ASR_GEN_KW = {
+    'itn': True,
+    'use_itn': True,
+    'sentence_timestamp': True,
+    'output_timestamp': True,
+    'return_time_stamps': True,
+    'disable_update': True,
+    'no_speech_threshold': 0.6,
+}
+
+# fast 模式下不向模型索取 token 级时间戳（避免误导）
+_ASR_GEN_KW_FAST = {
+    'itn': True,
+    'use_itn': True,
+    'disable_update': True,
+    'no_speech_threshold': 0.6,
+}
+
+_FAST_MODE_WARNED = False
+
+
+def _asr_gen_kwargs(nano_batch_mode: str = 'timestamps') -> dict:
+    """Inference kwargs for the selected Nano batch mode."""
+    if (nano_batch_mode or 'timestamps').lower() == 'fast':
+        return dict(_ASR_GEN_KW_FAST)
+    return dict(_ASR_GEN_KW)
+
+
+def _apply_vad_range_fallback(result: dict, seg: list, *, nano_batch_mode: str) -> dict:
+    """In fast mode, fill missing timestamps with the VAD segment range.
+
+    Does not invent token-accurate timing; only provides a whole-segment cue
+    so SRT/ASS still emit something. Call at the result-normalization boundary
+    (before LiveSubtitleSink), not inside the sink.
+    """
+    global _FAST_MODE_WARNED
+    mode = (nano_batch_mode or 'timestamps').lower()
+    if mode != 'fast':
+        return result
+    has_ts = bool(
+        result.get('timestamps')
+        or result.get('ctc_timestamps')
+        or result.get('timestamp')
+        or result.get('sentence_info')
+    )
+    if has_ts:
+        return result
+    if not _FAST_MODE_WARNED:
+        print(
+            '[Warn] nano_batch_mode=fast: no CTC/token timestamps; '
+            'subtitle timing falls back to VAD segment ranges (not token-accurate).'
+        )
+        _FAST_MODE_WARNED = True
+    start_ms = int(seg[0])
+    end_ms = int(seg[1])
+    # result is about to be offset by start_ms, so store relative range [0, dur]
+    dur_ms = max(end_ms - start_ms, 1)
+    text = (result.get('text') or '').strip()
+    out = dict(result)
+    out['sentence_info'] = [{'start': 0, 'end': dur_ms, 'text': text}]
+    out['timestamp'] = [[0, dur_ms]]
+    return out
 
 
 # ── 字幕流式落盘 ──────────────────────────────────────────────────
@@ -283,10 +339,14 @@ def run_once(
     language: str = 'auto',
     batch_size: int = 8,
     batch_size_s: int = 60,
+    nano_batch_mode: str = 'timestamps',
 ):
     """无 VAD：整文件一次 generate（短音频 / --no-vad）。"""
     inputs = [i.as_posix() if isinstance(i, Path) else i for i in inputs]
-    print(f'[ASR] start  files={len(inputs)} (no-vad) batch_size={batch_size}')
+    print(
+        f'[ASR] start  files={len(inputs)} (no-vad) batch_size={batch_size} '
+        f'nano_batch_mode={nano_batch_mode}'
+    )
     t0 = time.perf_counter()
     res = model.generate(
         input=inputs,
@@ -295,7 +355,8 @@ def run_once(
         batch_size_s=batch_size_s,
         language=language,
         merge_vad=False,
-        **_ASR_GEN_KW,
+        nano_batch_mode=nano_batch_mode,
+        **_asr_gen_kwargs(nano_batch_mode),
     )
     print(f'[ASR] done   elapsed={time.perf_counter() - t0:.1f}s')
     return res
@@ -311,6 +372,7 @@ def run_streaming_vad(
     subtitle_type: str | None = None,
     title: str = '',
     save: bool = True,
+    nano_batch_mode: str = 'timestamps',
 ) -> dict:
     """
     自建 VAD → ASR 管线，按时间顺序处理切片，每完成一批就追加写字幕。
@@ -367,10 +429,15 @@ def run_streaming_vad(
 
     print(
         f'[ASR] start  segs={len(vad_segments)} packs={len(packs)} '
-        f'audio={speech_s:.1f}s batch_size={batch_size} batch_size_s={batch_size_s}'
+        f'audio={speech_s:.1f}s batch_size={batch_size} batch_size_s={batch_size_s} '
+        f'nano_batch_mode={nano_batch_mode}'
     )
     t_asr = time.perf_counter()
-    asr_cfg = dict(language=language, **_ASR_GEN_KW)
+    asr_cfg = dict(
+        language=language,
+        nano_batch_mode=nano_batch_mode,
+        **_asr_gen_kwargs(nano_batch_mode),
+    )
 
     with tqdm(
         total=len(vad_segments),
@@ -394,6 +461,8 @@ def run_streaming_vad(
                 pbar.update(len(pack))
                 continue
             for (seg, _), res in zip(pack, results):
+                # fast 模式：在 offset 之前用 VAD 相对区间补时间戳
+                res = _apply_vad_range_fallback(res, seg, nano_batch_mode=nano_batch_mode)
                 offset_ms = int(seg[0])
                 res_abs = _offset_result(res, offset_ms)
                 sink.append_segment(res_abs)
@@ -452,6 +521,8 @@ def main(args):
     vad_model:       表示开启VAD，VAD的作用是将长音频切割成短音频。
     batch_size:      ASR 每次送入的段数；流式 VAD 路径下也是每包段数上限。
     batch_size_s:    动态 batch 总音频时长（秒）。
+    nano_batch_mode: Fun-ASR-Nano 多段 LLM 批处理策略（timestamps/fast/sequential）。
+    allow_download:  是否允许 hub 下载 / 远程校验（默认关，缓存优先）。
     '''
     stype = args.subtitle_type
     model = args.model_name
@@ -463,6 +534,10 @@ def main(args):
     title = getattr(args, 'title', '') or ''
     batch_size = max(1, int(getattr(args, 'batch_size', 8) or 8))
     batch_size_s = max(1, int(getattr(args, 'batch_size_s', 60) or 60))
+    nano_batch_mode = (getattr(args, 'nano_batch_mode', None) or 'timestamps').lower()
+    allow_download = bool(getattr(args, 'allow_download', False))
+    check_latest = bool(getattr(args, 'check_latest', False))
+    model_revision = getattr(args, 'model_revision', None)
     vad_model = DEFAULT_VAD_MODEL if use_vad else None
 
     if model in model_mapping:
@@ -472,16 +547,31 @@ def main(args):
         model_name = model
         hub = 'hf' if 'Fun-ASR-Nano' in model else 'ms'
 
+    # If mapping resolved to a local path that doesn't exist, fall back to hub id
+    # so cache_dir + local_files_only can still locate the snapshot under model_zoo.
+    model_arg = model_name
+    if isinstance(model_name, Path):
+        if model_name.exists():
+            model_arg = model_name.as_posix()
+        else:
+            # Prefer the hub id (model_mapping value) so snapshot_download can
+            # resolve from HF/MS cache under model_zoo without re-downloading.
+            mapped = model_mapping.get(model, model)
+            model_arg = mapped if isinstance(mapped, str) else model_name.as_posix()
+
+    cache_policy = 'online' if allow_download else 'cache-only'
     print(
         f'[Config] language={language} vad={"on" if use_vad else "off"} '
         f'stream={"on" if use_vad else "off"} '
         f'batch_size={batch_size} batch_size_s={batch_size_s}s '
-        f'cache={os.environ["MODELSCOPE_CACHE"]}'
+        f'nano_batch_mode={nano_batch_mode} '
+        f'cache={os.environ["MODELSCOPE_CACHE"]} policy={cache_policy} '
+        f'check_latest={check_latest}'
     )
     print('[Model] loading...')
     t_load = time.perf_counter()
-    model = AutoModel(
-        model=model_name,
+    auto_kwargs = dict(
+        model=model_arg,
         vad_model=vad_model,
         vad_kwargs={'max_single_segment_time': MAX_SINGLE_SEGMENT_MS} if vad_model else None,
         device='cuda:0',
@@ -491,7 +581,29 @@ def main(args):
         disable_pbar=True,
         disable_update=True,
         log_level='ERROR',
+        # cache-first / offline policy (hub helpers forward these)
+        cache_dir=os.environ.get('MODELSCOPE_CACHE') or _cache_root.as_posix(),
+        local_files_only=not allow_download,
+        check_latest=check_latest,
     )
+    if model_revision:
+        auto_kwargs['model_revision'] = model_revision
+        if vad_model:
+            auto_kwargs['vad_model_revision'] = model_revision
+    try:
+        model = AutoModel(**auto_kwargs)
+    except Exception as e:
+        if not allow_download:
+            raise RuntimeError(
+                f'Failed to load model from local cache only.\n'
+                f'  model={model_arg!r}\n'
+                f'  cache={auto_kwargs["cache_dir"]!r}\n'
+                f'  hub={hub}\n'
+                f'Re-run with --allow-download to fetch missing artifacts, '
+                f'or ensure the model is fully cached under model_zoo.\n'
+                f'Original error: {e}'
+            ) from e
+        raise
     print(f'[Model] ready  load={time.perf_counter() - t_load:.1f}s')
 
     # 有 VAD：流式写字幕；无 VAD：整文件一次出结果
@@ -506,6 +618,7 @@ def main(args):
                 subtitle_type=stype,
                 title=title,
                 save=args.save_to_file,
+                nano_batch_mode=nano_batch_mode,
             )
         return
 
@@ -515,6 +628,7 @@ def main(args):
         language=language,
         batch_size=batch_size,
         batch_size_s=batch_size_s,
+        nano_batch_mode=nano_batch_mode,
     )
     results: list[str | Iterator[str]] = []
     for i, o in zip(args.input, model_output):

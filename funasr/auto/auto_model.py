@@ -231,6 +231,11 @@ class AutoModel:
             vad_kwargs.setdefault("ncpu", kwargs.get("ncpu", 4))
             if "hub" in kwargs:
                 vad_kwargs.setdefault("hub", kwargs["hub"])
+            # Forward cache / offline policy so VAD uses the same hub settings
+            # as the main ASR model (CLI cache-first / local_files_only).
+            for _k in ("cache_dir", "local_files_only", "check_latest"):
+                if _k in kwargs:
+                    vad_kwargs.setdefault(_k, kwargs[_k])
             vad_model, vad_kwargs = self.build_model(**vad_kwargs)
 
         # if punc_model is not None, build punc model else None
@@ -244,6 +249,9 @@ class AutoModel:
             punc_kwargs.setdefault("ncpu", kwargs.get("ncpu", 4))
             if "hub" in kwargs:
                 punc_kwargs.setdefault("hub", kwargs["hub"])
+            for _k in ("cache_dir", "local_files_only", "check_latest"):
+                if _k in kwargs:
+                    punc_kwargs.setdefault(_k, kwargs[_k])
             punc_model, punc_kwargs = self.build_model(**punc_kwargs)
 
         # if spk_model is not None, build spk model else None
@@ -260,6 +268,9 @@ class AutoModel:
             spk_kwargs.setdefault("ncpu", kwargs.get("ncpu", 4))
             if "hub" in kwargs:
                 spk_kwargs.setdefault("hub", kwargs["hub"])
+            for _k in ("cache_dir", "local_files_only", "check_latest"):
+                if _k in kwargs:
+                    spk_kwargs.setdefault(_k, kwargs[_k])
             spk_model, spk_kwargs = self.build_model(**spk_kwargs)
             self.cb_model = ClusterBackend(**cb_kwargs).to(kwargs["device"])
             spk_mode = kwargs.get("spk_mode", "punc_segment")

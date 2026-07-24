@@ -6,8 +6,24 @@ from omegaconf import OmegaConf, DictConfig
 from funasr.download.name_maps_from_hub import name_maps_ms, name_maps_hf, name_maps_openai
 
 
-def download_model(**kwargs):
+def _cache_miss_error(hub: str, model_id: str, *, cache_dir=None, local_files_only=False, cause=None):
+    """Build an actionable error for a missing / unreadable hub cache entry."""
+    cache_msg = f"cache_dir={cache_dir!r}" if cache_dir else "cache_dir=<default>"
+    hint = (
+        "Re-run with --allow-download (or set local_files_only=False) to fetch missing artifacts."
+        if local_files_only
+        else "Check network access and model id, or pass a local model directory."
+    )
+    msg = (
+        f"Failed to resolve model from {hub}: {model_id!r} "
+        f"({cache_msg}, local_files_only={local_files_only}). {hint}"
+    )
+    if cause is not None:
+        msg = f"{msg} Original error: {cause}"
+    return RuntimeError(msg)
 
+
+def download_model(**kwargs):
     """Download model from hub and parse its configuration.
 
     Resolves model name aliases, downloads from ModelScope or HuggingFace,
@@ -16,7 +32,7 @@ def download_model(**kwargs):
 
     Args:
         **kwargs: Must include 'model' (str). Optional: 'hub', 'model_revision',
-            'is_training', etc.
+            'cache_dir', 'local_files_only', 'check_latest', 'is_training', etc.
 
     Returns:
         dict: Complete kwargs with resolved paths, model class name, and config.
@@ -43,7 +59,7 @@ def download_model(**kwargs):
 
 def download_from_ms(**kwargs):
     """Download from ms.
-    
+
         Args:
             **kwargs: Additional keyword arguments.
         """
@@ -51,16 +67,34 @@ def download_from_ms(**kwargs):
     if model_or_path in name_maps_ms:
         model_or_path = name_maps_ms[model_or_path]
     model_revision = kwargs.get("model_revision", "master")
+    cache_dir = kwargs.get("cache_dir", None)
+    local_files_only = bool(kwargs.get("local_files_only", False))
+    check_latest = kwargs.get("check_latest", True)
     if not os.path.exists(model_or_path) and "model_path" not in kwargs:
         try:
             model_or_path = get_or_download_model_dir(
                 model_or_path,
                 model_revision,
                 is_training=kwargs.get("is_training"),
-                check_latest=kwargs.get("check_latest", True),
+                check_latest=check_latest,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
         except Exception as e:
-            print(f"Download: {model_or_path} failed!: {e}")
+            raise _cache_miss_error(
+                "ModelScope",
+                model_or_path,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                cause=e,
+            ) from e
+        if not os.path.exists(model_or_path):
+            raise _cache_miss_error(
+                "ModelScope",
+                kwargs.get("model"),
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
 
     kwargs["model_path"] = model_or_path if "model_path" not in kwargs else kwargs["model_path"]
     model_or_path = kwargs["model_path"]
@@ -121,7 +155,7 @@ def download_from_ms(**kwargs):
 
 def download_from_hf(**kwargs):
     """Download from hf.
-    
+
         Args:
             **kwargs: Additional keyword arguments.
         """
@@ -129,16 +163,34 @@ def download_from_hf(**kwargs):
     if model_or_path in name_maps_hf:
         model_or_path = name_maps_hf[model_or_path]
     model_revision = kwargs.get("model_revision", "master")
+    cache_dir = kwargs.get("cache_dir", None)
+    local_files_only = bool(kwargs.get("local_files_only", False))
+    check_latest = kwargs.get("check_latest", True)
     if not os.path.exists(model_or_path) and "model_path" not in kwargs:
         try:
             model_or_path = get_or_download_model_dir_hf(
                 model_or_path,
                 model_revision,
                 is_training=kwargs.get("is_training"),
-                check_latest=kwargs.get("check_latest", True),
+                check_latest=check_latest,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
             )
         except Exception as e:
-            print(f"Download: {model_or_path} failed!: {e}")
+            raise _cache_miss_error(
+                "HuggingFace",
+                model_or_path,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                cause=e,
+            ) from e
+        if not os.path.exists(model_or_path):
+            raise _cache_miss_error(
+                "HuggingFace",
+                kwargs.get("model"),
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+            )
 
     kwargs["model_path"] = model_or_path if "model_path" not in kwargs else kwargs["model_path"]
 
@@ -189,9 +241,8 @@ def download_from_hf(**kwargs):
 
 
 def add_file_root_path(model_or_path: str, file_path_metas: dict, cfg={}):
-
     """Add file root path.
-    
+
         Args:
             model_or_path: TODO.
             file_path_metas: TODO.
@@ -243,13 +294,20 @@ def get_or_download_model_dir(
     model_revision=None,
     is_training=False,
     check_latest=True,
+    cache_dir=None,
+    local_files_only=False,
 ):
     """Get local model directory or download model if necessary.
 
     Args:
         model (str): model id or path to local model directory.
         model_revision  (str, optional): model version number.
-        :param is_training:
+        is_training (bool): whether invoked from trainer.
+        check_latest (bool): when True and model is a local path, optionally
+            contact ModelScope to verify the cache is up to date. Default True
+            preserves library online behavior; CLI scripts should pass False.
+        cache_dir (str, optional): ModelScope cache root override.
+        local_files_only (bool): if True, never contact the hub; raise on miss.
     """
     from modelscope.hub.check_model import check_local_model_is_latest
     from modelscope.hub.snapshot_download import snapshot_download
@@ -258,18 +316,27 @@ def get_or_download_model_dir(
 
     key = Invoke.LOCAL_TRAINER if is_training else Invoke.PIPELINE
 
-    if os.path.exists(model) and check_latest:
+    if os.path.exists(model):
+        # Local filesystem path: return it directly. Only contact the hub for a
+        # freshness check when explicitly requested and not in local-only mode.
         model_cache_dir = model if os.path.isdir(model) else os.path.dirname(model)
-        try:
-            check_local_model_is_latest(
-                model_cache_dir, user_agent={Invoke.KEY: key, ThirdParty.KEY: "funasr"}
-            )
-        except:
-            print("could not check the latest version")
-    else:
-        model_cache_dir = snapshot_download(
-            model, revision=model_revision, user_agent={Invoke.KEY: key, ThirdParty.KEY: "funasr"}
-        )
+        if check_latest and not local_files_only:
+            try:
+                check_local_model_is_latest(
+                    model_cache_dir, user_agent={Invoke.KEY: key, ThirdParty.KEY: "funasr"}
+                )
+            except Exception:
+                print("could not check the latest version")
+        return model_cache_dir
+
+    snap_kwargs = {
+        "revision": model_revision,
+        "user_agent": {Invoke.KEY: key, ThirdParty.KEY: "funasr"},
+        "local_files_only": bool(local_files_only),
+    }
+    if cache_dir is not None:
+        snap_kwargs["cache_dir"] = cache_dir
+    model_cache_dir = snapshot_download(model, **snap_kwargs)
     return model_cache_dir
 
 
@@ -278,15 +345,41 @@ def get_or_download_model_dir_hf(
     model_revision=None,
     is_training=False,
     check_latest=True,
+    cache_dir=None,
+    local_files_only=False,
 ):
     """Get local model directory or download model if necessary.
 
     Args:
         model (str): model id or path to local model directory.
-        model_revision  (str, optional): model version number.
-        :param is_training:
+        model_revision  (str, optional): model version number. The historical
+            default "master" is treated as None so HuggingFace uses the repo
+            default branch (typically "main").
+        is_training (bool): unused; kept for signature parity with MS helper.
+        check_latest (bool): unused for HF (no equivalent remote freshness
+            check); accepted for API symmetry.
+        cache_dir (str, optional): HuggingFace hub cache root override.
+        local_files_only (bool): if True, never contact the hub; raise on miss.
     """
     from huggingface_hub import snapshot_download
 
-    model_cache_dir = snapshot_download(model)
+    if os.path.exists(model):
+        return model if os.path.isdir(model) else os.path.dirname(model)
+
+    # FunASR historically defaulted model_revision to "master" (ModelScope).
+    # HuggingFace repos use "main"; pass None so the hub picks the default.
+    revision = model_revision
+    if revision in (None, "", "master"):
+        revision = None
+
+    snap_kwargs = {
+        "local_files_only": bool(local_files_only),
+    }
+    if revision is not None:
+        snap_kwargs["revision"] = revision
+    if cache_dir is not None:
+        snap_kwargs["cache_dir"] = cache_dir
+    # check_latest has no HF equivalent; ignored intentionally.
+    _ = (is_training, check_latest)
+    model_cache_dir = snapshot_download(model, **snap_kwargs)
     return model_cache_dir

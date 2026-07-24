@@ -735,32 +735,51 @@ class FunASRNano(nn.Module):
             **kwargs,
         )
 
-    def _inference_llm_batch(self, data_in, data_lengths, key, tokenizer, frontend, **kwargs):
-        """Batched LLM decoding for multiple VAD segments at once.
-
-        Builds each segment's inputs_embeds via the single-sample
-        inference_prepare, left-pads them into one batch, and runs a single
-        llm.generate. This greatly improves GPU utilization for the small LLM
-        decoder (the per-segment, batch_size=1 path underuses the GPU).
-        CTC timestamps are not produced in batched mode.
-        """
-        # normalize nested key (e.g. [[k1, k2, ...]]) like the single-sample path
+    def _normalize_inference_keys(self, key, n: int):
+        """Flatten nested key lists and ensure one key per segment."""
         if key is not None and len(key) > 0 and isinstance(key[0], (list, tuple)):
             key = list(key[0])
-        embs = []
-        keys = []
-        for i, d in enumerate(data_in):
-            k_i = [key[i]] if key is not None and i < len(key) else None
-            emb_i, _c, _b, _s, _m = self.inference_prepare(
-                [d], data_lengths, k_i, tokenizer, frontend, **kwargs
-            )
-            embs.append(emb_i)
-            keys.append(key[i] if key is not None and i < len(key) else f"rand_{i}")
+        if key is None:
+            return [f"rand_{i}" for i in range(n)]
+        keys = list(key)
+        if len(keys) < n:
+            keys = keys * n
+        return keys[:n]
 
+    def _resolve_llm_dtype(self, **kwargs):
         llm_dtype = kwargs.get("llm_dtype", "fp32")
         if llm_dtype == "fp32":
             llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
             llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
+        return llm_dtype
+
+    def _prepare_multi_segment(self, data_in, data_lengths, key, tokenizer, frontend, **kwargs):
+        """Run single-sample inference_prepare for every segment in order.
+
+        Returns:
+            keys: list[str]
+            embs: list[Tensor[1, T_i, D]]
+            contents_list: list[dict]
+            meta_list: list[dict]  (each may contain encoder_out / encoder_out_lens)
+        """
+        keys = self._normalize_inference_keys(key, len(data_in))
+        embs = []
+        contents_list = []
+        meta_list = []
+        for i, d in enumerate(data_in):
+            k_i = [keys[i]]
+            data_lengths_i = self._slice_batch_value(data_lengths, i)
+            emb_i, contents_i, _batch_i, _source_i, meta_i = self.inference_prepare(
+                [d], data_lengths_i, k_i, tokenizer, frontend, **kwargs
+            )
+            embs.append(emb_i)
+            contents_list.append(contents_i)
+            meta_list.append(meta_i)
+        return keys, embs, contents_list, meta_list
+
+    def _batched_llm_generate(self, embs, tokenizer, **kwargs):
+        """Left-pad segment embeds and run one llm.generate for the whole pack."""
+        llm_dtype = self._resolve_llm_dtype(**kwargs)
         dt = dtype_map[llm_dtype]
         device = embs[0].device
         self.llm = self.llm.to(dt)
@@ -800,6 +819,57 @@ class FunASRNano(nn.Module):
         texts = tokenizer.batch_decode(
             generated_ids, skip_special_tokens=kwargs.get("skip_special_tokens", True)
         )
+        return texts
+
+    def _attach_ctc_timestamps(self, result, meta_data):
+        """Run CTC forced alignment for one segment and attach timestamp fields.
+
+        Mirrors the single-sample inference_llm CTC path so sequential and
+        batched-with-timestamps modes produce the same field layout.
+        """
+        if self.ctc_decoder is None:
+            return
+        if "encoder_out" not in meta_data or "encoder_out_lens" not in meta_data:
+            return
+
+        encoder_out = meta_data["encoder_out"]
+        encoder_out_lens = meta_data["encoder_out_lens"]
+        decoder_out, _decoder_out_lens = self.ctc_decoder(encoder_out, encoder_out_lens)
+        ctc_logits = self.ctc.log_softmax(decoder_out)
+
+        x = ctc_logits[0, : encoder_out_lens[0].item(), :]
+        yseq = x.argmax(dim=-1)
+        yseq = torch.unique_consecutive(yseq, dim=-1)
+        mask = yseq != self.blank_id
+        token_int = yseq[mask].tolist()
+        ctc_text = self.ctc_tokenizer.decode(token_int)
+
+        result["ctc_text"] = ctc_text.replace("<|nospeech|>", "")
+        target_ids = torch.tensor(
+            self.ctc_tokenizer.encode(result["ctc_text"]), dtype=torch.int64
+        )
+        result["ctc_timestamps"] = forced_align(x, target_ids, self.blank_id)
+        target_ids = torch.tensor(self.ctc_tokenizer.encode(result["text"]), dtype=torch.int64)
+        result["timestamps"] = forced_align(x, target_ids, self.blank_id)
+        for timestamps in (result["timestamps"], result["ctc_timestamps"]):
+            for timestamp in timestamps:
+                timestamp["token"] = self.ctc_tokenizer.decode([timestamp["token"]])
+                timestamp["start_time"] = timestamp["start_time"] * 6 * 10 / 1000
+                timestamp["end_time"] = timestamp["end_time"] * 6 * 10 / 1000
+
+    def _inference_llm_batch(self, data_in, data_lengths, key, tokenizer, frontend, **kwargs):
+        """Batched LLM decoding for multiple VAD segments at once.
+
+        Builds each segment's inputs_embeds via the single-sample
+        inference_prepare, left-pads them into one batch, and runs a single
+        llm.generate. This greatly improves GPU utilization for the small LLM
+        decoder (the per-segment, batch_size=1 path underuses the GPU).
+        CTC timestamps are not produced in this fast path.
+        """
+        keys, embs, _contents_list, _meta_list = self._prepare_multi_segment(
+            data_in, data_lengths, key, tokenizer, frontend, **kwargs
+        )
+        texts = self._batched_llm_generate(embs, tokenizer, **kwargs)
         results = []
         for i, t in enumerate(texts):
             t = kwargs.get("prev_text", "") + t
@@ -811,6 +881,41 @@ class FunASRNano(nn.Module):
                 }
             )
         return results, {}
+
+    def _inference_llm_batch_with_ctc_timestamps(
+        self, data_in, data_lengths, key, tokenizer, frontend, **kwargs
+    ):
+        """Batched LLM generate + per-segment CTC forced alignment.
+
+        One left-padded llm.generate covers the full pack (the GPU bottleneck);
+        CTC forced alignment stays per-segment because it is short, variable-
+        length, and correctness-sensitive. Result order matches input order and
+        field layout matches the sequential CTC path.
+        """
+        keys, embs, contents_list, meta_list = self._prepare_multi_segment(
+            data_in, data_lengths, key, tokenizer, frontend, **kwargs
+        )
+        texts = self._batched_llm_generate(embs, tokenizer, **kwargs)
+
+        results = []
+        meta_data = {}
+        for i, t in enumerate(texts):
+            t = kwargs.get("prev_text", "") + t
+            label = None
+            contents_i = contents_list[i] if i < len(contents_list) else None
+            if contents_i is not None and contents_i.get("assistant"):
+                label = contents_i["assistant"][-1]
+            result_i = {
+                "key": keys[i],
+                "text": re.sub(r"\s+", " ", t.replace("/sil", " ")),
+                "text_tn": re.sub(r"[^\w\s\u3000\u4e00-\u9fff]+", "", t),
+            }
+            if label is not None:
+                result_i["label"] = label
+            self._attach_ctc_timestamps(result_i, meta_list[i])
+            results.append(result_i)
+            self._merge_inference_meta(meta_data, meta_list[i])
+        return results, meta_data
 
     @staticmethod
     def _slice_batch_value(value, index):
@@ -839,6 +944,10 @@ class FunASRNano(nn.Module):
         if key is not None and len(key) > 0 and isinstance(key[0], (list, tuple)):
             key = list(key[0])
 
+        # Force sequential single-sample path even if nano_batch_mode is set.
+        kwargs = dict(kwargs)
+        kwargs["nano_batch_mode"] = "sequential"
+
         results = []
         meta_data = {}
         for i, data_i in enumerate(data_in):
@@ -866,24 +975,41 @@ class FunASRNano(nn.Module):
         **kwargs,
     ):
         """Inference llm.
-        
+
             Args:
                 data_in: Input data (audio samples, file paths, or text).
                 data_lengths: Lengths of each input sample in the batch.
                 key: Sample identifiers.
                 tokenizer: Tokenizer instance for text encoding/decoding.
                 frontend: Audio frontend for feature extraction.
-                **kwargs: Additional keyword arguments.
+                **kwargs: Additional keyword arguments. Recognized:
+                    nano_batch_mode (str): multi-segment dispatch policy when a
+                        CTC decoder is loaded:
+                        - "timestamps" (default): one batched llm.generate plus
+                          per-segment CTC forced alignment (SRT/ASS safe).
+                        - "fast": batched LLM only; no CTC timestamps.
+                        - "sequential": one llm.generate per segment (oracle).
+                        When no CTC decoder is loaded, multi-segment always uses
+                        the fast batched path.
             """
-        # Only batch when CTC timestamps are not needed; the batched path does not
-        # produce ctc_timestamps, so fall back to the single-sample path when a CTC
-        # decoder is loaded (preserves timestamp behavior).
+        # Multi-segment dispatch. Without CTC, always use the fast batch path.
+        # With CTC, honor nano_batch_mode (default: timestamps).
         if len(data_in) > 1:
             if self.ctc_decoder is None:
                 return self._inference_llm_batch(
                     data_in, data_lengths, key, tokenizer, frontend, **kwargs
                 )
-            return self._inference_llm_ctc_sequential(
+            mode = (kwargs.get("nano_batch_mode") or "timestamps").lower()
+            if mode == "fast":
+                return self._inference_llm_batch(
+                    data_in, data_lengths, key, tokenizer, frontend, **kwargs
+                )
+            if mode == "sequential":
+                return self._inference_llm_ctc_sequential(
+                    data_in, data_lengths, key, tokenizer, frontend, **kwargs
+                )
+            # default / "timestamps"
+            return self._inference_llm_batch_with_ctc_timestamps(
                 data_in, data_lengths, key, tokenizer, frontend, **kwargs
             )
         inputs_embeds, contents, batch, source_ids, meta_data = self.inference_prepare(
@@ -912,10 +1038,7 @@ class FunASRNano(nn.Module):
                 text = self.ctc_tokenizer.decode(token_int)
                 ctc_results.append({"key": key[i], "text": text, "ctc_logits": x})
 
-        llm_dtype = kwargs.get("llm_dtype", "fp32")
-        if llm_dtype == "fp32":
-            llm_dtype = "fp16" if kwargs.get("fp16", False) else llm_dtype
-            llm_dtype = "bf16" if kwargs.get("bf16", False) else llm_dtype
+        llm_dtype = self._resolve_llm_dtype(**kwargs)
 
         autocast_device_type = resolve_autocast_device_type(kwargs.get("device", "cuda"))
         with torch.autocast(
