@@ -24,6 +24,7 @@ uv run scripts/_funasr.py -m FunAudioLLM/Fun-ASR-Nano-2512 -i $audio -s "raw|srt
 # 首次拉模型：uv run scripts/_funasr.py -m funasrNano2512 -i $audio -s srt --allow-download
 '''
 
+import gc
 import json
 import logging
 import os
@@ -31,6 +32,8 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+
+import torch
 
 # ── 缓存 / 日志：必须在 import funasr / huggingface 之前 ──────────
 # 注意：不能 from scripts import ROOT —— scripts/__init__.py 会立刻 import funasr
@@ -67,7 +70,7 @@ model_dir = ROOT / 'model_zoo/models'
 DEFAULT_VAD_MODEL = 'fsmn-vad'
 # DEFAULT_VAD_MODEL = model_dir / 'iic/speech_fsmn_vad_zh-cn-16k-common-pytorch'
 MERGE_LENGTH_S = 15
-MAX_SINGLE_SEGMENT_MS = 30000
+DEFAULT_MAX_SINGLE_SEGMENT_S = 15
 
 model_mapping: dict[str, str] = {
     'sensevoice': 'SenseVoiceSmall',
@@ -103,6 +106,31 @@ def _asr_gen_kwargs(nano_batch_mode: str = 'timestamps') -> dict:
     if (nano_batch_mode or 'timestamps').lower() == 'fast':
         return dict(_ASR_GEN_KW_FAST)
     return dict(_ASR_GEN_KW)
+
+
+def _cap_vad_segment_length(vad_segments: list[list], max_segment_ms: int) -> list[list]:
+    """将 VAD 段硬切到安全上限，避免单段绕过动态 batch 预算。"""
+    capped_segments: list[list] = []
+    for segment in vad_segments:
+        start_ms, end_ms = int(segment[0]), int(segment[1])
+        if end_ms <= start_ms:
+            continue
+        for chunk_start_ms in range(start_ms, end_ms, max_segment_ms):
+            capped_segments.append([chunk_start_ms, min(chunk_start_ms + max_segment_ms, end_ms)])
+    return capped_segments
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    """兼容不同 PyTorch 版本的 CUDA OOM 异常类型与错误文本。"""
+    oom_type = getattr(torch.cuda, 'OutOfMemoryError', ())
+    return isinstance(error, oom_type) or 'cuda out of memory' in str(error).lower()
+
+
+def _release_cuda_memory() -> None:
+    """OOM 退避前释放已失效的临时张量和 PyTorch 缓存块。"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _apply_vad_range_fallback(result: dict, seg: list, *, nano_batch_mode: str) -> dict:
@@ -369,6 +397,7 @@ def run_streaming_vad(
     language: str = 'auto',
     batch_size: int = 8,
     batch_size_s: int = 60,
+    max_single_segment_s: int = DEFAULT_MAX_SINGLE_SEGMENT_S,
     subtitle_type: str | None = None,
     title: str = '',
     save: bool = True,
@@ -400,7 +429,13 @@ def run_streaming_vad(
     vad_segments = (vad_out[0].get('value') if vad_out else None) or []
     if MERGE_LENGTH_S > 0 and vad_segments:
         vad_segments = merge_vad(vad_segments, MERGE_LENGTH_S * 1000)
-    print(f'[VAD] done  segs={len(vad_segments)}  elapsed={time.perf_counter() - t_vad:.1f}s')
+    max_segment_ms = max(int(max_single_segment_s) * 1000, 1000)
+    # merge_vad 可能把相邻语音重新合并；再次硬切才能保证任何单段都不会绕过显存预算。
+    vad_segments = _cap_vad_segment_length(vad_segments, max_segment_ms)
+    print(
+        f'[VAD] done  segs={len(vad_segments)} max_segment={max_segment_ms / 1000:g}s '
+        f'elapsed={time.perf_counter() - t_vad:.1f}s'
+    )
 
     if not vad_segments:
         print('[ASR] empty speech, skip')
@@ -412,24 +447,29 @@ def run_streaming_vad(
     speech_lengths = len(speech)
     speech_s = speech_lengths / float(fs)
 
-    # ── 3) 按时间顺序动态打包（batch_size 段数上限 + batch_size_s 时长上限）──
+    # ── 3) 按时间顺序动态打包 ───────────────────────────────────────
+    # Nano 会把同一包的 inputs_embeds 左侧补齐到最长段；实际峰值近似
+    # ``包内段数 × 最长段时长``，而不是音频时长简单求和。按补齐后的预算
+    # 打包可避免 29s + 1s 在 batch_size_s=30 时被错误地当作 30s 批次。
     pack_limit_ms = max(int(batch_size_s) * 1000, 1)
     packs: list[list[tuple[list, int]]] = []  # each: [( [start_ms,end_ms], orig_idx ), ...]
     cur: list[tuple[list, int]] = []
-    cur_ms = 0
+    cur_max_ms = 0
     for idx, seg in enumerate(vad_segments):
         dur = int(seg[1]) - int(seg[0])
-        if cur and (len(cur) >= batch_size or cur_ms + dur > pack_limit_ms):
+        padded_pack_ms = max(cur_max_ms, dur) * (len(cur) + 1)
+        if cur and (len(cur) >= batch_size or padded_pack_ms > pack_limit_ms):
             packs.append(cur)
-            cur, cur_ms = [], 0
+            cur, cur_max_ms = [], 0
         cur.append((seg, idx))
-        cur_ms += dur
+        cur_max_ms = max(cur_max_ms, dur)
     if cur:
         packs.append(cur)
 
     print(
         f'[ASR] start  segs={len(vad_segments)} packs={len(packs)} '
         f'audio={speech_s:.1f}s batch_size={batch_size} batch_size_s={batch_size_s} '
+        f'max_segment={max_segment_ms / 1000:g}s pack_budget=padded-duration '
         f'nano_batch_mode={nano_batch_mode}'
     )
     t_asr = time.perf_counter()
@@ -439,16 +479,11 @@ def run_streaming_vad(
         **_asr_gen_kwargs(nano_batch_mode),
     )
 
-    with tqdm(
-        total=len(vad_segments),
-        unit='seg',
-        desc='ASR',
-        dynamic_ncols=True,
-        mininterval=0.5,
-    ) as pbar:
-        for pack in packs:
-            speech_j, _ = slice_padding_audio_samples(speech, speech_lengths, pack)
-            # 让 inference 内部一次吃完整包，避免再被 batch_size=1 拆碎
+    def infer_pack(pack: list[tuple[list, int]]) -> list[tuple[list[tuple[list, int]], list[dict]]]:
+        """推理一包；CUDA OOM 时二分退避，优先保住已写出的字幕。"""
+        speech_j, _ = slice_padding_audio_samples(speech, speech_lengths, pack)
+        try:
+            # 让 inference 内部一次吃完整包，避免再被 batch_size=1 拆碎。
             results = model.inference(
                 speech_j,
                 input_len=None,
@@ -457,20 +492,49 @@ def run_streaming_vad(
                 batch_size=max(len(speech_j), 1),
                 **asr_cfg,
             )
-            if not results:
-                pbar.update(len(pack))
-                continue
-            for (seg, _), res in zip(pack, results):
-                # fast 模式：在 offset 之前用 VAD 相对区间补时间戳
-                res = _apply_vad_range_fallback(res, seg, nano_batch_mode=nano_batch_mode)
-                offset_ms = int(seg[0])
-                res_abs = _offset_result(res, offset_ms)
-                sink.append_segment(res_abs)
-                snippet = (res_abs.get('text') or '').replace('\n', ' ').strip()
-                if len(snippet) > 24:
-                    snippet = snippet[:24] + '…'
-                pbar.set_postfix_str(snippet, refresh=False)
-                pbar.update(1)
+            return [(pack, results or [])]
+        except RuntimeError as error:
+            if not _is_cuda_oom(error):
+                raise
+            _release_cuda_memory()
+            if len(pack) == 1:
+                seg = pack[0][0]
+                duration_s = (int(seg[1]) - int(seg[0])) / 1000
+                raise RuntimeError(
+                    'CUDA OOM even after reducing the ASR batch to one segment '
+                    f'({duration_s:g}s). Re-run with --max-single-segment-s 10 '
+                    'or 8, and close other GPU processes.'
+                ) from error
+            mid = len(pack) // 2
+            print(
+                f'[Warn] CUDA OOM for ASR pack of {len(pack)} segments; '
+                f'retrying as {len(pack[:mid])}+{len(pack[mid:])} after clearing cache.'
+            )
+            return infer_pack(pack[:mid]) + infer_pack(pack[mid:])
+
+    with tqdm(
+        total=len(vad_segments),
+        unit='seg',
+        desc='ASR',
+        dynamic_ncols=True,
+        mininterval=0.5,
+    ) as pbar:
+        for pack in packs:
+            for resolved_pack, results in infer_pack(pack):
+                if not results:
+                    pbar.update(len(resolved_pack))
+                    continue
+                for (seg, _), res in zip(resolved_pack, results):
+                    # fast 模式：在 offset 之前用 VAD 相对区间补时间戳
+                    res = _apply_vad_range_fallback(res, seg, nano_batch_mode=nano_batch_mode)
+                    offset_ms = int(seg[0])
+                    res_abs = _offset_result(res, offset_ms)
+                    sink.append_segment(res_abs)
+                    snippet = (res_abs.get('text') or '').replace('\n', ' ').strip()
+                    if len(snippet) > 24:
+                        snippet = snippet[:24] + '…'
+                    pbar.set_postfix_str(snippet, refresh=False)
+                    pbar.update(1)
 
     elapsed = time.perf_counter() - t_asr
     rtf = elapsed / speech_s if speech_s > 0 else 0.0
@@ -520,7 +584,8 @@ def main(args):
     '''model_dir:      模型名称，或本地磁盘中的模型路径。
     vad_model:       表示开启VAD，VAD的作用是将长音频切割成短音频。
     batch_size:      ASR 每次送入的段数；流式 VAD 路径下也是每包段数上限。
-    batch_size_s:    动态 batch 总音频时长（秒）。
+    batch_size_s:    动态 batch 的补齐后时长预算（秒）。
+    max_single_segment_s: VAD/ASR 单段最长时长；越小越省显存。
     nano_batch_mode: Fun-ASR-Nano 多段 LLM 批处理策略（timestamps/fast/sequential）。
     allow_download:  是否允许 hub 下载 / 远程校验（默认关，缓存优先）。
     '''
@@ -534,6 +599,7 @@ def main(args):
     title = getattr(args, 'title', '') or ''
     batch_size = max(1, int(getattr(args, 'batch_size', 8) or 8))
     batch_size_s = max(1, int(getattr(args, 'batch_size_s', 60) or 60))
+    max_single_segment_s = max(1, int(getattr(args, 'max_single_segment_s', DEFAULT_MAX_SINGLE_SEGMENT_S) or DEFAULT_MAX_SINGLE_SEGMENT_S))
     nano_batch_mode = (getattr(args, 'nano_batch_mode', None) or 'timestamps').lower()
     allow_download = bool(getattr(args, 'allow_download', False))
     check_latest = bool(getattr(args, 'check_latest', False))
@@ -563,17 +629,17 @@ def main(args):
     print(
         f'[Config] language={language} vad={"on" if use_vad else "off"} '
         f'stream={"on" if use_vad else "off"} '
-        f'batch_size={batch_size} batch_size_s={batch_size_s}s '
+        f'batch_size={batch_size} batch_size_s={batch_size_s}s max_single_segment_s={max_single_segment_s}s '
         f'nano_batch_mode={nano_batch_mode} '
         f'cache={os.environ["MODELSCOPE_CACHE"]} policy={cache_policy} '
         f'check_latest={check_latest}'
     )
     print('[Model] loading...')
     t_load = time.perf_counter()
-    auto_kwargs = dict(
+    auto_kwargs = dict(  # noqa: C408
         model=model_arg,
         vad_model=vad_model,
-        vad_kwargs={'max_single_segment_time': MAX_SINGLE_SEGMENT_MS} if vad_model else None,
+        vad_kwargs={'max_single_segment_time': max_single_segment_s * 1000} if vad_model else None,
         device='cuda:0',
         trust_remote_code=True,
         hub=hub,
@@ -615,6 +681,7 @@ def main(args):
                 language=language,
                 batch_size=batch_size,
                 batch_size_s=batch_size_s,
+                max_single_segment_s=max_single_segment_s,
                 subtitle_type=stype,
                 title=title,
                 save=args.save_to_file,

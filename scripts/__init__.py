@@ -62,6 +62,15 @@ def parse_transcribe_args():
     help='VAD dynamic-batch total speech duration in seconds (default: 60). Larger → fewer ASR calls, faster',
   )
   parser.add_argument(
+    '--max-single-segment-s',
+    type=int,
+    default=15,
+    help=(
+      'maximum VAD/ASR segment duration in seconds (default: 15). '
+      'Lower values reduce Fun-ASR-Nano peak VRAM; try 10 or 8 if a 12 GB GPU still OOMs'
+    ),
+  )
+  parser.add_argument(
     '--save-to-file',
     action='store_true',
     default=True,

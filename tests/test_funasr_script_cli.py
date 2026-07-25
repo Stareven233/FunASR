@@ -77,6 +77,7 @@ def test_parse_transcribe_args_defaults(monkeypatch):
     assert args.nano_batch_mode == "timestamps"
     assert args.batch_size == 8
     assert args.batch_size_s == 60
+    assert args.max_single_segment_s == 15
 
 
 def test_parse_transcribe_args_opt_in_flags(monkeypatch):
@@ -97,6 +98,8 @@ def test_parse_transcribe_args_opt_in_flags(monkeypatch):
             "16",
             "--batch-size-s",
             "120",
+            "--max-single-segment-s",
+            "10",
         ],
     )
     args = parse_transcribe_args()
@@ -105,6 +108,7 @@ def test_parse_transcribe_args_opt_in_flags(monkeypatch):
     assert args.nano_batch_mode == "fast"
     assert args.batch_size == 16
     assert args.batch_size_s == 120
+    assert args.max_single_segment_s == 10
 
 
 def test_main_forwards_cache_policy_and_nano_mode(monkeypatch, tmp_path, capsys):
@@ -135,6 +139,7 @@ def test_main_forwards_cache_policy_and_nano_mode(monkeypatch, tmp_path, capsys)
         title="",
         batch_size=16,
         batch_size_s=120,
+        max_single_segment_s=15,
         save_to_file=False,
         allow_download=False,
         check_latest=False,
@@ -187,6 +192,7 @@ def test_main_allow_download_sets_online(monkeypatch, tmp_path):
         title="",
         batch_size=8,
         batch_size_s=60,
+        max_single_segment_s=15,
         save_to_file=False,
         allow_download=True,
         check_latest=True,
@@ -222,6 +228,7 @@ def test_main_cache_miss_mentions_allow_download(monkeypatch, tmp_path):
         title="",
         batch_size=8,
         batch_size_s=60,
+        max_single_segment_s=15,
         save_to_file=False,
         allow_download=False,
         check_latest=False,
@@ -294,3 +301,101 @@ def test_run_streaming_vad_packs_and_forwards_mode(monkeypatch, tmp_path):
     assert inference_calls[0]["batch_size"] == 2
     assert inference_calls[0].get("output_timestamp") is True
     assert result["text"]  # merged non-empty
+
+
+
+def test_cap_vad_segment_length_enforces_hard_limit(monkeypatch):
+    mod = _import_funasr_script(monkeypatch)
+
+    assert mod._cap_vad_segment_length([[0, 31_000]], 15_000) == [
+        [0, 15_000],
+        [15_000, 30_000],
+        [30_000, 31_000],
+    ]
+
+
+def test_run_streaming_vad_uses_padded_duration_budget(monkeypatch, tmp_path):
+    """20s + 1s fits a sum budget of 30s, but not Nano's padded batch budget."""
+    mod = _import_funasr_script(monkeypatch)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"RIFF")
+    vad_segments = [[0, 20_000], [20_000, 21_000], [21_000, 22_000]]
+    batch_lengths = []
+
+    class FakeModel:
+        def __init__(self):
+            self.vad_model = object()
+            self.vad_kwargs = {}
+            self.model = object()
+            self.kwargs = {"frontend": SimpleNamespace(fs=16000), "fs": 16000}
+
+        def inference(self, data, **kwargs):
+            if kwargs.get("model") is self.vad_model:
+                return [{"value": vad_segments}]
+            size = len(data)
+            batch_lengths.append(size)
+            return [{"key": f"k{i}", "text": f"t{i}"} for i in range(size)]
+
+    monkeypatch.setattr(mod, "load_audio_text_image_video", lambda *_a, **_k: [0.0] * 16000 * 22)
+    monkeypatch.setattr(
+        mod,
+        "slice_padding_audio_samples",
+        lambda _speech, _speech_lengths, pack: ([f"seg{i}" for i in range(len(pack))], None),
+    )
+    monkeypatch.setattr(mod, "merge_vad", lambda segs, *_a, **_k: segs)
+
+    mod.run_streaming_vad(
+        FakeModel(),
+        audio,
+        batch_size=2,
+        batch_size_s=30,
+        max_single_segment_s=30,
+        save=False,
+        nano_batch_mode="fast",
+    )
+
+    assert batch_lengths == [1, 2]
+
+
+def test_run_streaming_vad_retries_oom_by_splitting_pack(monkeypatch, tmp_path):
+    mod = _import_funasr_script(monkeypatch)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"RIFF")
+    batch_lengths = []
+
+    class FakeModel:
+        def __init__(self):
+            self.vad_model = object()
+            self.vad_kwargs = {}
+            self.model = object()
+            self.kwargs = {"frontend": SimpleNamespace(fs=16000), "fs": 16000}
+
+        def inference(self, data, **kwargs):
+            if kwargs.get("model") is self.vad_model:
+                return [{"value": [[0, 1_000], [1_000, 2_000]]}]
+            size = len(data)
+            batch_lengths.append(size)
+            if size > 1:
+                raise mod.torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return [{"key": "k", "text": "ok"}]
+
+    monkeypatch.setattr(mod, "load_audio_text_image_video", lambda *_a, **_k: [0.0] * 16000 * 2)
+    monkeypatch.setattr(
+        mod,
+        "slice_padding_audio_samples",
+        lambda _speech, _speech_lengths, pack: ([f"seg{i}" for i in range(len(pack))], None),
+    )
+    monkeypatch.setattr(mod, "merge_vad", lambda segs, *_a, **_k: segs)
+    monkeypatch.setattr(mod, "_release_cuda_memory", lambda: None)
+
+    result = mod.run_streaming_vad(
+        FakeModel(),
+        audio,
+        batch_size=2,
+        batch_size_s=30,
+        save=False,
+        nano_batch_mode="fast",
+    )
+
+    assert batch_lengths == [2, 1, 1]
+    assert result["text"] == "ok ok"
